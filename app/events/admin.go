@@ -29,6 +29,7 @@ type admin struct {
 	softBan      bool // if true, the user not banned automatically, but only restricted
 	dry          bool
 	warnMsg      string
+	restoreMsg   string
 }
 
 const (
@@ -38,7 +39,7 @@ const (
 )
 
 // ReportBan a ban message to admin chat with a button to unban the user
-func (a *admin) ReportBan(banUserStr string, msg *bot.Message) {
+func (a *admin) ReportBan(banUserStr string, msg *bot.Message, spamReplyID int) {
 	log.Printf("[DEBUG] report to admin chat, ban msgsData for %s, group: %d", banUserStr, a.adminChatID)
 	text := strings.ReplaceAll(escapeMarkDownV1Text(msg.Text), "\n", " ")
 	would := ""
@@ -46,7 +47,7 @@ func (a *admin) ReportBan(banUserStr string, msg *bot.Message) {
 		would = "would have "
 	}
 	forwardMsg := fmt.Sprintf("**%spermanently banned [%s](tg://user?id=%d)**\n\n%s\n\n", would, banUserStr, msg.From.ID, text)
-	if err := a.sendWithUnbanMarkup(forwardMsg, "change ban", msg.From, msg.ID, a.adminChatID); err != nil {
+	if err := a.sendWithUnbanMarkup(forwardMsg, "change ban", msg.From, msg.ID, a.adminChatID, spamReplyID); err != nil {
 		log.Printf("[WARN] failed to send admin message, %v", err)
 	}
 }
@@ -381,7 +382,7 @@ func (a *admin) callbackBanConfirmed(query *tbapi.CallbackQuery) error {
 		return fmt.Errorf("failed to update spam for %q: %w", cleanMsg, err)
 	}
 
-	userID, msgID, parseErr := a.parseCallbackData(query.Data)
+	userID, msgID, spamReplyID, parseErr := a.parseCallbackData(query.Data)
 	if parseErr != nil {
 		return fmt.Errorf("failed to parse callback's userID %q: %w", query.Data, parseErr)
 	}
@@ -395,6 +396,11 @@ func (a *admin) callbackBanConfirmed(query *tbapi.CallbackQuery) error {
 
 	// for  soft ban we need to ba user for real on confirmation
 	if a.softBan && !a.trainingMode {
+		// we can delete our reply to the chat
+		deleteMsg := tbapi.NewDeleteMessage(a.primChatID, spamReplyID)
+		if err := send(deleteMsg, a.tbAPI); err != nil {
+			log.Printf("[WARN] failed to delete our spam reply message %d: %v", spamReplyID, err)
+		}
 		userName, err := a.extractUsername(query.Message.Text) // try to extract username from the message
 		if err != nil {
 			log.Printf("[DEBUG] failed to extract username from %q: %v", query.Message.Text, err)
@@ -424,7 +430,7 @@ func (a *admin) callbackUnbanConfirmed(query *tbapi.CallbackQuery) error {
 		return fmt.Errorf("failed to send callback response: %w", err)
 	}
 
-	userID, _, err := a.parseCallbackData(callbackData)
+	userID, _, spamReplyID, err := a.parseCallbackData(callbackData)
 	if err != nil {
 		return fmt.Errorf("failed to parse callback msgsData %q: %w", callbackData, err)
 	}
@@ -479,6 +485,39 @@ func (a *admin) callbackUnbanConfirmed(query *tbapi.CallbackQuery) error {
 	if err := send(editMsg, a.tbAPI); err != nil {
 		return fmt.Errorf("failed to edit message, chatID:%d, msgID:%d, %w", chatID, query.Message.MessageID, err)
 	}
+
+	// we can delete our reply to the chat
+	if spamReplyID != 0 {
+		deleteMsg := tbapi.NewDeleteMessage(a.primChatID, spamReplyID)
+		if err := send(deleteMsg, a.tbAPI); err != nil {
+			log.Printf("[WARN] failed to delete our spam reply message %d: %v", spamReplyID, err)
+		}
+	}
+
+	if a.restoreMsg != "" {
+		// send the original message text back to the main chat and meniton the original poster
+		fmtName := ""
+		if name != "" {
+			fmtName = fmt.Sprintf("[%s](tg://user?id=%d)", name, userID)
+		} else {
+			displayName, err := a.extractDisplayname(query.Message.Text)
+			if err != nil {
+				log.Printf("[DEBUG] failed to extract displayname from %q: %v", query.Message.Text, err)
+				fmtName = fmt.Sprintf("[%d](tg://user?id=%d)", userID, userID)
+			} else {
+				fmtName = fmt.Sprintf("[%s](tg://user?id=%d)", displayName, userID)
+			}
+		}
+
+		msgText := fmt.Sprintf("%s, %s\n\n%s", fmtName, a.restoreMsg, cleanMsg)
+		tbMsg := tbapi.NewMessage(a.primChatID, msgText)
+		tbMsg.ParseMode = tbapi.ModeMarkdown
+		tbMsg.DisableWebPagePreview = true
+		if err := send(tbMsg, a.tbAPI); err != nil {
+			return fmt.Errorf("can't send message to telegram %q: %w", tbMsg.Text, err)
+		}
+	}
+
 	return nil
 }
 
@@ -519,7 +558,7 @@ func (a *admin) callbackShowInfo(query *tbapi.CallbackQuery) error {
 	callbackData := query.Data
 	spamInfoText := "**can't get spam info**"
 	spamInfo := []string{}
-	userID, _, err := a.parseCallbackData(callbackData)
+	userID, _, _, err := a.parseCallbackData(callbackData)
 	if err != nil {
 		spamInfo = append(spamInfo, fmt.Sprintf("**failed to parse userID from %q: %v**", callbackData[1:], err))
 	}
@@ -633,7 +672,7 @@ func (a *admin) getCleanMessage(msg string) (string, error) {
 // sendWithUnbanMarkup sends a message to admin chat and adds buttons to ui.
 // text is message with details and action it for the button label to unban, which is user id prefixed with "?" for confirmation;
 // the second button is to show info about the spam analysis.
-func (a *admin) sendWithUnbanMarkup(text, action string, user bot.User, msgID int, chatID int64) error {
+func (a *admin) sendWithUnbanMarkup(text, action string, user bot.User, msgID int, chatID int64, spamReplyID int) error {
 	log.Printf("[DEBUG] action response %q: user %+v, msgID:%d, text: %q", action, user, msgID, strings.ReplaceAll(text, "\n", "\\n"))
 	tbMsg := tbapi.NewMessage(chatID, text)
 	tbMsg.ParseMode = tbapi.ModeMarkdown
@@ -642,9 +681,9 @@ func (a *admin) sendWithUnbanMarkup(text, action string, user bot.User, msgID in
 	tbMsg.ReplyMarkup = tbapi.NewInlineKeyboardMarkup(
 		tbapi.NewInlineKeyboardRow(
 			// ?userID to request confirmation
-			tbapi.NewInlineKeyboardButtonData("⛔︎ "+action, fmt.Sprintf("%s%d:%d", confirmationPrefix, user.ID, msgID)),
+			tbapi.NewInlineKeyboardButtonData("⛔︎ "+action, fmt.Sprintf("%s%d:%d:%d", confirmationPrefix, user.ID, msgID, spamReplyID)),
 			// !userID to request info
-			tbapi.NewInlineKeyboardButtonData("️⚑ info", fmt.Sprintf("%s%d:%d", infoPrefix, user.ID, msgID)),
+			tbapi.NewInlineKeyboardButtonData("️⚑ info", fmt.Sprintf("%s%d:%d:%d", infoPrefix, user.ID, msgID, spamReplyID)),
 		),
 	)
 
@@ -654,10 +693,10 @@ func (a *admin) sendWithUnbanMarkup(text, action string, user bot.User, msgID in
 	return nil
 }
 
-// callbackData is a string with userID and msgID separated by ":"
-func (a *admin) parseCallbackData(data string) (userID int64, msgID int, err error) {
-	if len(data) < 3 {
-		return 0, 0, fmt.Errorf("unexpected callback data, too short %q", data)
+// callbackData is a string with userID, msgID and spamReplyID separated by ":"
+func (a *admin) parseCallbackData(data string) (userID int64, msgID int, spamReplyID int, err error) {
+	if len(data) < 4 {
+		return 0, 0, 0, fmt.Errorf("unexpected callback data, too short %q", data)
 	}
 
 	// remove prefix if present from the parsed data
@@ -666,17 +705,21 @@ func (a *admin) parseCallbackData(data string) (userID int64, msgID int, err err
 	}
 
 	parts := strings.Split(data, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("unexpected callback data, should have both ids %q", data)
+	if len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("unexpected callback data, should have 3 ids %q", data)
 	}
 	if userID, err = strconv.ParseInt(parts[0], 10, 64); err != nil {
-		return 0, 0, fmt.Errorf("failed to parse userID %q: %w", parts[0], err)
+		return 0, 0, 0, fmt.Errorf("failed to parse userID %q: %w", parts[0], err)
 	}
 	if msgID, err = strconv.Atoi(parts[1]); err != nil {
-		return 0, 0, fmt.Errorf("failed to parse msgID %q: %w", parts[1], err)
+		return 0, 0, 0, fmt.Errorf("failed to parse msgID %q: %w", parts[1], err)
 	}
 
-	return userID, msgID, nil
+	if spamReplyID, err = strconv.Atoi(parts[2]); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to parse spamReplyID %q: %w", parts[2], err)
+	}
+
+	return userID, msgID, spamReplyID, nil
 }
 
 // extractUsername tries to extract the username from a ban message
@@ -705,4 +748,16 @@ func (a *admin) sinceQuery(query *tbapi.CallbackQuery) time.Duration {
 		res = 0
 	}
 	return res
+}
+
+// extractDisplayname tries to extract the displayname from a ban message
+func (a *admin) extractDisplayname(text string) (string, error) {
+	// regex for plain format: {200312168 umputun Umputun U}
+	plainRegex := regexp.MustCompile(`\{\d+ \S* (.+?)\}`)
+	matches := plainRegex.FindStringSubmatch(text)
+	if len(matches) > 1 {
+		return matches[1], nil
+	}
+
+	return "", errors.New("displayname not found")
 }
