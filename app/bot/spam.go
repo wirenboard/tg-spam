@@ -101,7 +101,7 @@ func (s *SpamFilter) OnMessage(msg Message) (response Response) {
 		}
 		spamRespMsg := msgPrefix;
 		return Response{Text: spamRespMsg, Send: true, ReplyTo: msg.ID, BanInterval: PermanentBanDuration, CheckResults: checkResults,
-			DeleteReplyTo: true, User: User{Username: msg.From.Username, ID: msg.From.ID, DisplayName: msg.From.DisplayName},
+			DeleteReplyTo: true, User: User{Username: msg.From.Username, ID: msg.From.ID, DisplayName: msg.From.DisplayName}, ChannelID: msg.SenderChat.ID,
 		}
 	}
 	log.Printf("[DEBUG] user %s is not a spammer, %s", displayUsername, checkResultStr)
