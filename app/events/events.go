@@ -136,6 +136,22 @@ func banUserOrChannel(r banRequest) error {
 		r.duration = 1 * time.Minute
 	}
 
+	if r.channelID != 0 {
+		resp, err := r.tbAPI.Request(tbapi.BanChatSenderChatConfig{
+			ChatID:       r.chatID,
+			SenderChatID: r.channelID,
+			UntilDate:    int(time.Now().Add(r.duration).Unix()),
+		})
+		if err != nil {
+			return err
+		}
+		if !resp.Ok {
+			return fmt.Errorf("response is not Ok: %v", string(resp.Result))
+		}
+		log.Printf("[INFO] channel %s banned by bot for %v", r.userName, r.duration)
+		return nil // even if soft ban mode enabled, we can't restrict channels anyway
+	}
+
 	if r.restrict { // soft ban mode
 		resp, err := r.tbAPI.Request(tbapi.RestrictChatMemberConfig{
 			ChatMemberConfig: tbapi.ChatMemberConfig{
@@ -159,22 +175,6 @@ func banUserOrChannel(r banRequest) error {
 			return fmt.Errorf("response is not Ok: %v", string(resp.Result))
 		}
 		log.Printf("[INFO] %s restricted by bot for %v", r.userName, r.duration)
-		return nil
-	}
-
-	if r.channelID != 0 {
-		resp, err := r.tbAPI.Request(tbapi.BanChatSenderChatConfig{
-			ChatID:       r.chatID,
-			SenderChatID: r.channelID,
-			UntilDate:    int(time.Now().Add(r.duration).Unix()),
-		})
-		if err != nil {
-			return err
-		}
-		if !resp.Ok {
-			return fmt.Errorf("response is not Ok: %v", string(resp.Result))
-		}
-		log.Printf("[INFO] channel %s banned by bot for %v", r.userName, r.duration)
 		return nil
 	}
 
