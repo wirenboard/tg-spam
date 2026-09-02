@@ -25,7 +25,7 @@ OUT=$(docker compose --env-file deploy/wb-compat/stack-config-test.env -f docker
 
 # image identity: the host must pull the CI-published image, never build or reuse a
 # local tag - a stale local image is how a deploy silently ran old code before
-need 'image: ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master'
+need 'image: ghcr.io/(wb-aleksandr-khlebnikov|wirenboard)/tg-spam:'
 need 'pull_policy: always'
 
 # the superuser list must reach the container as an env var, and nothing may pass --super:
@@ -64,7 +64,7 @@ fi
 UC=deploy/wb-compat/docker-compose.update-channel.yml
 OUT=$(docker compose --env-file deploy/wb-compat/update-channel-test.env -f "$UC" config)
 
-need 'image: ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master'
+need 'image: ghcr.io/(wb-aleksandr-khlebnikov|wirenboard)/tg-spam:'
 need 'pull_policy: always'
 # this bot keeps its dynamic data at the volume root, mounted at /srv/var - the mount
 # point and FILES_DYNAMIC must agree or it starts on an empty database

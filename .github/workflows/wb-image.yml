@@ -44,7 +44,9 @@ jobs:
       # so the build needs nothing downloaded.
       - name: build and push to ghcr.io
         env:
-          IMAGE: ghcr.io/wb-aleksandr-khlebnikov/tg-spam
+          # owner-derived: after the repo moves to the wirenboard org this publishes
+          # ghcr.io/wirenboard/tg-spam with no change to this file
+          IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu

@@ -10,6 +10,6 @@
 # does not build during a deploy — the Portainer request dies on the proxy timeout.
 set -eu
 cd "$(dirname "$0")/../.."
-IMAGE=ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master
+IMAGE=${IMAGE:-ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master}
 docker build -t "$IMAGE" .
 echo "built $IMAGE - deploy the stack with PULL_POLICY=never"

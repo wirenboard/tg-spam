@@ -16,8 +16,10 @@ Portainer, not in the code.
 | Web UI | `:8081` | none |
 | Ban mode | hard ban | soft ban (restrict) |
 
-Both pull `ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master`. The `:<sha>` tag of every
-build is kept too, so a stack can be pinned to one build by setting its image tag.
+Both pull `ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master` through the stack variable
+`IMAGE`. CI publishes under whichever account owns the repository, so after a move to the
+wirenboard org the stacks only need `IMAGE=ghcr.io/wirenboard/tg-spam:master`. Every build
+also keeps a `:<sha>` tag, so setting `IMAGE` to it pins or rolls back one stack.
 
 ## How an update reaches the bots
 
