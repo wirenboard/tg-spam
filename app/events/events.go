@@ -74,8 +74,17 @@ func truncateString(s string, maxRunes int, suffix string) string {
 	return string(runes[:maxRunes]) + suffix
 }
 
-// send a message to the telegram as markdown first and if failed - as plain text
+// send delivers tbMsg with the fallback cascade of sendReturning, discarding the sent message.
 func send(tbMsg tbapi.Chattable, tbAPI TbAPI) error {
+	_, err := sendReturning(tbMsg, tbAPI)
+	return err
+}
+
+// sendReturning delivers tbMsg and returns the message telegram created, for callers that need
+// its ID. Markdown is tried first because it renders nicer, then HTML for texts carrying a
+// tg://user link, then plain text: a username with underscores makes telegram reject markdown,
+// and the message must still be delivered.
+func sendReturning(tbMsg tbapi.Chattable, tbAPI TbAPI) (tbapi.Message, error) {
 	withParseMode := func(tbMsg tbapi.Chattable, parseMode string) tbapi.Chattable {
 		switch msg := tbMsg.(type) {
 		case tbapi.MessageConfig:
@@ -102,33 +111,29 @@ func send(tbMsg tbapi.Chattable, tbAPI TbAPI) error {
 	}
 
 	// try markdown first, as it's the nicer rendering
-	msg := withParseMode(tbMsg, tbapi.ModeMarkdown)
-	if _, err := tbAPI.Send(msg); err != nil {
-		log.Printf("[WARN] failed to send message as markdown, %v", err)
-
-		// for messages with Telegram profile links, we need to ensure the links are preserved
-		// when falling back to plain text, even if markdown fails
-		if hasTelegramProfileLink {
-			// use HTML mode as a fallback, which better handles usernames with special characters
-			htmlMsg := withParseMode(tbMsg, tbapi.ModeHTML)
-			if _, err := tbAPI.Send(htmlMsg); err != nil {
-				// if HTML also fails, fall back to plain text
-				log.Printf("[WARN] failed to send message as HTML, %v", err)
-				plainMsg := withParseMode(tbMsg, "") // plain text
-				if _, err := tbAPI.Send(plainMsg); err != nil {
-					return fmt.Errorf("can't send message to telegram: %w", err)
-				}
-			}
-			return nil
-		}
-
-		// for regular messages, just fall back to plain text
-		msg = withParseMode(tbMsg, "")
-		if _, err := tbAPI.Send(msg); err != nil {
-			return fmt.Errorf("can't send message to telegram: %w", err)
-		}
+	sent, err := tbAPI.Send(withParseMode(tbMsg, tbapi.ModeMarkdown))
+	if err == nil {
+		return sent, nil
 	}
-	return nil
+	log.Printf("[WARN] failed to send message as markdown, %v", err)
+
+	// for messages with Telegram profile links, we need to ensure the links are preserved
+	// when falling back to plain text, even if markdown fails
+	if hasTelegramProfileLink {
+		// use HTML mode as a fallback, which better handles usernames with special characters
+		htmlSent, htmlErr := tbAPI.Send(withParseMode(tbMsg, tbapi.ModeHTML))
+		if htmlErr == nil {
+			return htmlSent, nil
+		}
+		// if HTML also fails, fall back to plain text
+		log.Printf("[WARN] failed to send message as HTML, %v", htmlErr)
+	}
+
+	sent, err = tbAPI.Send(withParseMode(tbMsg, "")) // plain text
+	if err != nil {
+		return tbapi.Message{}, fmt.Errorf("can't send message to telegram: %w", err)
+	}
+	return sent, nil
 }
 
 type banRequest struct {

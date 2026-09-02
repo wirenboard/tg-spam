@@ -28,6 +28,14 @@ OUT=$(docker compose --env-file deploy/wb-compat/stack-config-test.env -f docker
 need 'image: ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master'
 need 'pull_policy: always'
 
+# the superuser list must reach the container as an env var, and nothing may pass --super:
+# that flag overrides the env var, which is how the list set in Portainer was ignored
+need 'SUPER_USER:'
+if printf '%s\n' "$OUT" | grep -Eq -- '--super'; then
+  echo "FAIL: --super on the command line overrides SUPER_USER from the stack env" >&2
+  fail=1
+fi
+
 # values the stack env pins
 need 'OPENAI_MODEL: gpt-5.6-sol'
 need 'MIN_PROBABILITY: "?35"?'

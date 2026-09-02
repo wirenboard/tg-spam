@@ -1001,9 +1001,7 @@ func (a *admin) callbackUnbanConfirmed(query *tbapi.CallbackQuery) error {
 
 		restoreText := fmt.Sprintf("%s, %s\n\n%s", mention, escapeMarkDownV1Text(a.restoreMsg), escapeMarkDownV1Text(cleanMsg))
 		tbMsg := tbapi.NewMessage(a.primChatID, restoreText)
-		tbMsg.ParseMode = tbapi.ModeMarkdown
-		tbMsg.LinkPreviewOptions = tbapi.LinkPreviewOptions{IsDisabled: true}
-		if _, err := a.tbAPI.Send(tbMsg); err != nil {
+		if err := send(tbMsg, a.tbAPI); err != nil {
 			return fmt.Errorf("can't send restore message to telegram %q: %w", restoreText, err)
 		}
 	}

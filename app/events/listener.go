@@ -702,17 +702,17 @@ func (l *TelegramListener) sendBotResponse(resp bot.Response, chatID int64, noti
 
 	log.Printf("[DEBUG] bot response - %+v, reply-to:%d", strings.ReplaceAll(resp.Text, "\n", "\\n"), resp.ReplyTo)
 	tbMsg := tbapi.NewMessage(chatID, resp.Text)
-	tbMsg.ParseMode = tbapi.ModeMarkdown
-	tbMsg.LinkPreviewOptions = tbapi.LinkPreviewOptions{IsDisabled: true}
 	tbMsg.ReplyParameters = tbapi.ReplyParameters{MessageID: resp.ReplyTo}
 	tbMsg.DisableNotification = notifyType == NotificationSilent
 
-	tbResp, err := l.TbAPI.Send(tbMsg)
+	// sendReturning, not a bare Send: the markdown fallback has to stay, and the ID of the sent
+	// message is what lets the admin actions clean this reply up later
+	sent, err := sendReturning(tbMsg, l.TbAPI)
 	if err != nil {
 		return 0, fmt.Errorf("can't send message to telegram %q: %w", resp.Text, err)
 	}
 
-	return tbResp.MessageID, nil
+	return sent.MessageID, nil
 }
 
 func (l *TelegramListener) getChatID(group string) (int64, error) {
