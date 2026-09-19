@@ -55,9 +55,12 @@ jobs:
             --build-arg CI=github \
             --build-arg GITHUB_SHA="${{ github.sha }}" \
             --build-arg GIT_BRANCH="${{ github.ref_name }}" \
-            -t "$IMAGE:master" -t "$IMAGE:${{ github.sha }}" .
+            -t "$IMAGE:master" -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
           docker push "$IMAGE:master"
           docker push "$IMAGE:${{ github.sha }}"
+          # latest mirrors master so a bare "docker pull" never serves a stale
+          # manually-pushed image; deploys still pin :master / :<sha>
+          docker push "$IMAGE:latest"
           docker logout ghcr.io
 
       # Deploy runs only after the image is published, so a red build never reaches the
