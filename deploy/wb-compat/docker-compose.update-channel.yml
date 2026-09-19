@@ -8,7 +8,7 @@
 # Portainer: this repository is public.
 services:
   tg-aspam:
-    image: ${IMAGE:-ghcr.io/wb-aleksandr-khlebnikov/tg-spam:master}
+    image: ${IMAGE:-ghcr.io/wirenboard/tg-spam:master}
     # Set PULL_POLICY=never when the image was built on the host by build-image.sh
     # instead of being pulled (CI unavailable).
     pull_policy: ${PULL_POLICY:-always}
