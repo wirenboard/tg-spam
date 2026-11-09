@@ -41,6 +41,12 @@ Each version change makes the bot back its database up next to it as
 `tg-spam.db.<version>-<timestamp>` inside the data volume (`MAX_BACKUPS=10`). To go back
 to a known build, set the stack's image tag to that build's `:<sha>` and redeploy.
 
+## Restoring a volume
+
+The host keeps nightly archives of its Docker volumes for the last three nights.
+[RESTORE.md](RESTORE.md) (in Russian, written for support) describes getting one file
+back, putting an old copy next to the current volume and replacing the volume in place.
+
 ## Things that have already broken
 
 - **One bot token, one process.** Telegram gives updates to a single long-polling
