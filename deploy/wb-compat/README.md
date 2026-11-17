@@ -55,12 +55,73 @@ but its data has to reach `/srv/data` first - either by moving the files inside 
 or by turning the mount point into a variable. A stack's repository URL cannot be changed
 after creation, so moving the stack to this repository needs a recreation regardless.
 
+## What is ours in this repository
+
+Everything outside these paths is upstream [umputun/tg-spam](https://github.com/umputun/tg-spam)
+byte for byte, at the release last merged:
+
+- `deploy/wb-compat/` - this README, the update channel's compose file, the build and check
+  scripts, our patches and our preset data;
+- `docker-compose.portainer.yml` - the support chat's compose file;
+- `.github/workflows/wb-*.yml` - our CI. Upstream's workflows are not kept: they build and
+  publish umputun/tg-spam.
+
+What we change in the bot itself is applied at build time, never committed into upstream's
+files. `build-image.sh` copies the tree, `prepare-tree.sh` applies every patch in
+`patches/` and appends `data/stop-words.txt` to the preset dictionary, and upstream's own
+`Dockerfile` builds the copy. That is the whole trick: since no upstream file differs, a
+merge of a new upstream release cannot conflict.
+
+| Patch | What it does | Why it is not upstream |
+|---|---|---|
+| `0001-restore-message-after-unban.patch` | `MESSAGE_RESTORE`: when an admin presses unban on a ban report, the bot posts the deleted text back to the chat, addressed to its author and prefixed with that message. Empty disables it; dry and training modes skip it, they never delete | Not proposed upstream yet |
+
+Before adding anything here, check that upstream has no option for it, and prefer sending
+the change upstream: every patch is code this fork has to carry through each release.
+
+## Updating from upstream
+
+`.github/workflows/wb-upstream-sync.yml` does it every morning with no one involved: it
+merges the newest upstream release into `master`, runs the same checks as a pull request
+(rendered stack config, the tests of the patched packages, the image build, and that every
+variable the two compose files set is still an option of the new binary), pushes the merge
+and starts `wb-image.yml`. Nothing to do while it stays green.
+
+When it fails, nothing has reached `master` or the bots. The run's log says why; if the
+merge itself went through, it waits on the branch `sync/upstream-<tag>`. The usual cause is
+a patch that no longer applies because upstream changed the lines around it:
+
+1. Check out the release tag in a scratch directory and apply the patch with
+   `git apply --3way deploy/wb-compat/patches/<patch>` taken from this repository.
+2. Resolve the conflicts, run the package's tests, commit, and regenerate the file with
+   `git format-patch -1 --stdout > <patch>`.
+3. Commit the refreshed patch to `sync/upstream-<tag>`, open a pull request into `master`
+   and merge it once `wb-image.yml` is green.
+
+When upstream gains the same feature, delete the patch and switch the compose files to
+upstream's option. With `patches/` empty, the image is plain upstream plus our preset
+stop phrases.
+
+A release can also be merged by hand, or an older one picked: run the workflow from the
+Actions tab with a tag. A manual `git merge <tag>` conflicts only under
+`.github/workflows`; keep this fork's side there.
+
+GitHub turns off a schedule in a public repository after 60 days without a commit and
+warns by mail first. A quiet upstream can get there; the Actions tab turns it back on.
+
 ## How an update reaches the bots
 
-Push to `master` → `.github/workflows/wb-image.yml` asserts the rendered production
-config, builds the image, publishes it to ghcr, and only then calls the Portainer webhook
-that redeploys the stack. A failed check or build leaves `:master` on the previous image
-and never reaches a bot.
+Push to `master` (by a merged pull request or by the upstream sync) →
+`.github/workflows/wb-image.yml` asserts the rendered production config, tests and builds
+the patched image, checks that it still has every option the stacks set, publishes it to
+ghcr, and only then calls the Portainer webhooks that redeploy the stacks. A failed check
+or build leaves `:master` on the previous image and never reaches a bot.
+
+The webhooks come from two repository secrets, `PORTAINER_WEBHOOK_WIRENBOARD_CHAT` and
+`PORTAINER_WEBHOOK_UPDATE_CH` (Portainer: the stack → **GitOps updates** → **Webhook** →
+**Copy link**). Without them a new image waits on ghcr until someone redeploys the stack.
+**Polling** does not fit here: it redeploys as soon as git changes, before CI has built the
+image.
 
 Nothing is built on the deployment host. It is a 2-CPU EC2 instance: the build takes
 minutes and dies on the reverse-proxy timeout, which is why builds through the Portainer
@@ -85,10 +146,13 @@ to a known build, set the stack's image tag to that build's `:<sha>` and redeplo
   implicit names are project-prefixed, so renaming a stack silently creates empty
   volumes - that is how the learned database was lost on 2026-04-16. A deploy without
   the names fails loudly instead.
-- **A database file does not mean the samples are in it.** Older versions kept samples in
-  text files, so `entrypoint.sh` seeds a sample file the volume has never seen (neither
-  `.txt` nor `.txt.loaded`). Without that the bot exits with "no pesistent spam or ham
-  samples found in the store".
+- **A database file does not mean the samples are in it.** Versions before 2026 kept
+  samples in text files, and a volume they wrote has a `tg-spam.db` with an empty samples
+  store: the bot then exits with "no pesistent spam or ham samples found in the store" and
+  upstream's `entrypoint.sh` does not reseed it, since it only fills a volume with no db.
+  Both live volumes were migrated in 2026. Should such a volume ever come back from an old
+  backup, copy `spam-samples.txt` and `ham-samples.txt` from the image's `/srv/preset` into
+  it before the start; the bot imports them and renames them to `.txt.loaded`.
 - **Importing a dictionary replaces the whole table**, unlike samples, whose import only
   clears preset-origin rows. Never seed `stop-words.txt` into a live volume: phrases added
   through the web UI would be dropped.
@@ -114,3 +178,7 @@ checked-out repository.
 Tokens and the superuser list live in the stack environment in Portainer (and in
 Bitwarden), never in this repository - it is public. The OpenAI key must come from the
 shared company account, not a personal one.
+
+`CAS_TOKEN` is the Combot API key for the CAS check (combot.org → Settings → API key,
+signed in with Telegram). Since 2026-10-25 api.cas.chat refuses requests without it; the
+bot then skips CAS and logs a warning once at startup.

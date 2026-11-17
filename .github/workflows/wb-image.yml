@@ -1,20 +1,22 @@
 name: wb-image
 
-# Publishes the image this fork's Portainer stacks run. Upstream's docker.yml needs
-# PKG_TOKEN/DOCKER_HUB_TOKEN, which only exist in umputun/tg-spam, so it cannot serve
-# the fork. The built-in GITHUB_TOKEN is enough to push to the fork's own ghcr namespace.
+# Publishes the image this fork's Portainer stacks run and redeploys them. The image is
+# upstream's own Dockerfile over this tree with deploy/wb-compat/patches applied, built by
+# deploy/wb-compat/build-image.sh. Upstream's docker.yml is not used: it needs
+# PKG_TOKEN/DOCKER_HUB_TOKEN, which only exist in umputun/tg-spam. The built-in GITHUB_TOKEN is
+# enough to push to the fork's own ghcr namespace.
 #
-# Only linux/amd64 is built: the deployment host is a single x86_64 EC2 instance, and
-# it is too slow to build this tree itself within the Portainer proxy timeout.
+# Only linux/amd64 is built: the deployment host is a single x86_64 EC2 instance, and it is
+# too slow to build this tree itself within the Portainer proxy timeout.
+#
+# wb-upstream-sync.yml starts this workflow by workflow_dispatch after it merges an upstream
+# release: its push is made with GITHUB_TOKEN, and such a push triggers no workflow.
 
+# Every branch push runs the checks and the build, so a pull request shows them on its head
+# commit; only master publishes and deploys (see the push steps).
 on:
   push:
-    branches: [master]
-  pull_request:
-    paths:
-      - docker-compose.portainer.yml
-      - deploy/wb-compat/**
-      - .github/workflows/wb-image.yml
+    branches: ["**"]
   workflow_dispatch:
 
 # :master is a moving tag, so two overlapping runs can publish out of order and leave it
@@ -25,9 +27,7 @@ concurrency:
 
 jobs:
   # Gate the deploy on the rendered production config, not just on the code: a broken
-  # compose file would otherwise reach the stacks through the webhook below. A pull
-  # request touching the stack files runs it too, so the config is verified before the
-  # merge instead of after the result has already become :master.
+  # compose file would otherwise reach the stacks through the webhook below.
   check-config:
     runs-on: ubuntu-latest
     steps:
@@ -39,15 +39,28 @@ jobs:
       - name: check rendered stack config
         run: sh deploy/wb-compat/check-stack-config.sh
 
+  # The tests of the packages our patches touch, on the patched copy of the tree. A patch that
+  # no longer applies to the upstream version in this tree fails here.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: test patched packages
+        run: sh deploy/wb-compat/test-image-tree.sh
+
   build:
-    needs: check-config
-    # :master and the deploy webhooks are master-only, so a manual run from another branch
-    # would publish that branch as :master and push it into the two production chats
-    if: github.ref == 'refs/heads/master'
+    needs: [check-config, test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    env:
+      # owner-derived, so a fork of this fork publishes under its own account
+      IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
     steps:
       - name: checkout
         uses: actions/checkout@v6
@@ -58,20 +71,30 @@ jobs:
       # codeload.github.com on every run, and a 429/503 there fails the job before it
       # starts (hit twice on 2026-08-17). The runner already ships docker with buildkit,
       # so the build needs nothing downloaded.
-      - name: build and push to ghcr.io
+      - name: build
+        run: |
+          set -eu
+          IMAGE="$IMAGE:master" sh deploy/wb-compat/build-image.sh \
+            --build-arg CI=github \
+            --build-arg GITHUB_SHA="${{ github.sha }}" \
+            --build-arg GIT_BRANCH="${{ github.ref_name }}" \
+            -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest"
+
+      # Every variable the two compose files hand the bot must still be an option of this
+      # build. An upstream release that renames or drops one would otherwise be ignored
+      # silently by go-flags, and the bot would run without that setting.
+      - name: check the options the stacks set
+        run: sh deploy/wb-compat/check-image-options.sh "$IMAGE:master"
+
+      # :master and the deploy webhooks are master-only: a pull request or a manual run from
+      # another branch only proves the image builds.
+      - name: push to ghcr.io
+        if: github.ref == 'refs/heads/master'
         env:
-          # owner-derived: after the repo moves to the wirenboard org this publishes
-          # ghcr.io/wirenboard/tg-spam with no change to this file
-          IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker build \
-            --build-arg CI=github \
-            --build-arg GITHUB_SHA="${{ github.sha }}" \
-            --build-arg GIT_BRANCH="${{ github.ref_name }}" \
-            -t "$IMAGE:master" -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
           docker push "$IMAGE:master"
           docker push "$IMAGE:${{ github.sha }}"
           # latest mirrors master so a bare "docker pull" never serves a stale
@@ -85,6 +108,7 @@ jobs:
       # the container. Without the secret the step is skipped, so the build stays usable
       # for anyone without deploy access.
       - name: trigger portainer redeploy
+        if: github.ref == 'refs/heads/master'
         env:
           WEBHOOK_CHAT: ${{ secrets.PORTAINER_WEBHOOK_WIRENBOARD_CHAT }}
           WEBHOOK_UPDATE_CH: ${{ secrets.PORTAINER_WEBHOOK_UPDATE_CH }}
