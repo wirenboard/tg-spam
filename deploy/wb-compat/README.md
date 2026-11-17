@@ -67,10 +67,13 @@ byte for byte, at the release last merged:
   publish umputun/tg-spam.
 
 What we change in the bot itself is applied at build time, never committed into upstream's
-files. `build-image.sh` copies the tree, `prepare-tree.sh` applies every patch in
-`patches/` and appends `data/stop-words.txt` to the preset dictionary, and upstream's own
-`Dockerfile` builds the copy. That is the whole trick: since no upstream file differs, a
-merge of a new upstream release cannot conflict.
+files. `prepare-tree.sh` checks the committed tree out into a temporary directory, applies
+every patch in `patches/` with `git apply --3way` and appends `data/stop-words.txt` to the
+preset dictionary; upstream's own `Dockerfile` then builds that directory
+(`build-image.sh`). That is the whole trick: since no upstream file differs, a merge of a
+new upstream release cannot conflict. And since a patch goes in as a three-way merge,
+upstream edits next to our lines merge on their own; only a change to the very lines we
+touch, or to code our patch calls, needs a person.
 
 | Patch | What it does | Why it is not upstream |
 |---|---|---|
@@ -91,12 +94,15 @@ When it fails, nothing has reached `master` or the bots. The run's log says why;
 merge itself went through, it waits on the branch `sync/upstream-<tag>`. The usual cause is
 a patch that no longer applies because upstream changed the lines around it:
 
-1. Check out the release tag in a scratch directory and apply the patch with
-   `git apply --3way deploy/wb-compat/patches/<patch>` taken from this repository.
-2. Resolve the conflicts, run the package's tests, commit, and regenerate the file with
-   `git format-patch -1 --stdout > <patch>`.
-3. Commit the refreshed patch to `sync/upstream-<tag>`, open a pull request into `master`
-   and merge it once `wb-image.yml` is green.
+1. In a clone of this repository, check the release tag out into a scratch worktree
+   (`git worktree add ../scratch <tag>`) and apply the patch there with
+   `git apply --3way <path to deploy/wb-compat/patches/the patch>`.
+2. Resolve the conflicts, make the package's tests pass
+   (`go test -short ./app/...`), commit, and regenerate the file with
+   `git format-patch -1 --full-index --stdout`. `--full-index` matters: the full blob ids in
+   the patch are what lets the next release apply it three-way.
+3. Commit the refreshed patch to `sync/upstream-<tag>`, push, open a pull request into
+   `master` and merge it once `wb-image.yml` is green.
 
 When upstream gains the same feature, delete the patch and switch the compose files to
 upstream's option. With `patches/` empty, the image is plain upstream plus our preset

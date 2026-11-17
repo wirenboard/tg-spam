@@ -1,4 +1,4 @@
-From 83ab9b6023e880269726a838d7eae203ffed5eca Mon Sep 17 00:00:00 2001
+From c7fa3db9ce7dcbfe6b84db99427f4e48bd9ea8de Mon Sep 17 00:00:00 2001
 From: "Aleksandr.Khlebnikov" <aleksandr.khlebnikov@wirenboard.com>
 Date: Tue, 17 Nov 2026 09:37:17 +0300
 Subject: [PATCH] Repost the original message after an admin unbans its author
@@ -12,17 +12,30 @@ Without it a wrongly banned author is unrestricted, but the question is gone and
 nothing tells them to ask again: with NO_SPAM_REPLY the chat never saw a word
 about the ban.
 ---
+ README.md                        |   1 +
  app/config/settings.go           |   1 +
  app/events/admin.go              |  26 +++++-
  app/events/admin_restore_test.go | 150 +++++++++++++++++++++++++++++++
  app/events/listener.go           |   2 +
  app/main.go                      |   2 +
  app/settings.go                  |   1 +
- 6 files changed, 181 insertions(+), 1 deletion(-)
+ 7 files changed, 182 insertions(+), 1 deletion(-)
  create mode 100644 app/events/admin_restore_test.go
 
+diff --git a/README.md b/README.md
+index 6569e47aa9ade7b110da018e1411b592b6875624..35cc97253ff86f98dee0ec5c640e443a4bde403b 100644
+--- a/README.md
++++ b/README.md
+@@ -820,6 +820,7 @@ message:
+       --message.spam=                   spam message (default: this is spam) [$MESSAGE_SPAM]
+       --message.dry=                    spam dry message (default: this is spam (dry mode)) [$MESSAGE_DRY]
+       --message.warn=                   warning message (default: You've violated our rules and this is your first and last warning. Further violations will lead to permanent access denial. Stay compliant or face the consequences!) [$MESSAGE_WARN]
++      --message.restore=                message to repost the original text with after an admin unbans its author, disabled if empty [$MESSAGE_RESTORE]
+ 
+ server:
+       --server.enabled                  enable web server [$SERVER_ENABLED]
 diff --git a/app/config/settings.go b/app/config/settings.go
-index 3eee032b..74c3ab53 100644
+index 3eee032ba2d0169bab7d6c40262227586453f092..74c3ab5300c095f199fcdd368b0090640fb587a4 100644
 --- a/app/config/settings.go
 +++ b/app/config/settings.go
 @@ -249,6 +249,7 @@ type MessageSettings struct {
@@ -34,7 +47,7 @@ index 3eee032b..74c3ab53 100644
  
  // ServerSettings contains web server settings
 diff --git a/app/events/admin.go b/app/events/admin.go
-index 52c565d5..9590906b 100644
+index 52c565d5be3a5e1be493347663d2431b32b2fb52..9590906ba9146b18bf48a97514e3a6e932eb503d 100644
 --- a/app/events/admin.go
 +++ b/app/events/admin.go
 @@ -38,6 +38,7 @@ type admin struct {
@@ -86,7 +99,7 @@ index 52c565d5..9590906b 100644
  
 diff --git a/app/events/admin_restore_test.go b/app/events/admin_restore_test.go
 new file mode 100644
-index 00000000..5542518c
+index 0000000000000000000000000000000000000000..5542518c2eebaacc9a0ef91212cbc17624c7ab86
 --- /dev/null
 +++ b/app/events/admin_restore_test.go
 @@ -0,0 +1,150 @@
@@ -241,7 +254,7 @@ index 00000000..5542518c
 +	assert.True(t, unbanned, "the unban itself happens before the repost")
 +}
 diff --git a/app/events/listener.go b/app/events/listener.go
-index dd08b9fd..90ae0743 100644
+index dd08b9fd42ea5e59eccc03f2ee47f497758af685..90ae07432f41d29ba0114fdfb73af1bf8fc15ee5 100644
 --- a/app/events/listener.go
 +++ b/app/events/listener.go
 @@ -53,6 +53,7 @@ type TelegramListener struct {
@@ -261,7 +274,7 @@ index dd08b9fd..90ae0743 100644
  		warnings: l.Warnings, warnThreshold: l.WarnThreshold, warnWindow: l.WarnWindow,
  	}
 diff --git a/app/main.go b/app/main.go
-index da42ba67..64218acd 100644
+index da42ba678bdb9065dae00d9bc6bd0e436930f737..64218acdf06e0ec3462cb4f0e5711c1dcb98d019 100644
 --- a/app/main.go
 +++ b/app/main.go
 @@ -217,6 +217,7 @@ type options struct {
@@ -281,7 +294,7 @@ index da42ba67..64218acd 100644
  		SuppressJoinMessage: settings.SuppressJoinMessage,
  		DeleteJoinMessages:  settings.Delete.JoinMessages,
 diff --git a/app/settings.go b/app/settings.go
-index a96efc51..f1612f25 100644
+index a96efc5162e7891f61928e0e78ef5756d2d58c31..f1612f256f57ff520b2ae50d2ee52a1d80bb0b58 100644
 --- a/app/settings.go
 +++ b/app/settings.go
 @@ -170,6 +170,7 @@ func optToSettings(opts options) *config.Settings {

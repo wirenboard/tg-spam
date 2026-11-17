@@ -1,7 +1,7 @@
 #!/bin/sh
-# Build the image both stacks run: upstream's own Dockerfile over a copy of this checkout,
-# prepared by prepare-tree.sh (our patches applied, our stop phrases added to the preset).
-# The checkout itself is never modified.
+# Build the image both stacks run: upstream's own Dockerfile over the tree prepare-tree.sh makes
+# from the committed HEAD (our patches applied, our stop phrases in the preset). The checkout
+# itself is never modified, and uncommitted changes are not built.
 #
 # CI (.github/workflows/wb-image.yml) builds with this script. It is also the fallback when CI
 # cannot publish (wb-image.yml red, ghcr unreachable): run it on the deployment host from a
@@ -16,12 +16,8 @@ cd "$(dirname "$0")/../.."
 IMAGE=${IMAGE:-ghcr.io/wirenboard/tg-spam:master}
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"; git worktree prune' EXIT INT TERM
+sh deploy/wb-compat/prepare-tree.sh "$tmp/src"
 
-# tracked and new files as they are in the working tree, without .git and ignored files
-git ls-files -z --cached --others --exclude-standard |
-  tar --null --ignore-failed-read -T - -cf - | tar -xf - -C "$tmp"
-sh deploy/wb-compat/prepare-tree.sh "$tmp"
-
-docker build "$@" -t "$IMAGE" "$tmp"
+docker build "$@" -t "$IMAGE" "$tmp/src"
 echo "built $IMAGE"

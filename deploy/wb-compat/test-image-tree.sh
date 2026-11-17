@@ -1,11 +1,11 @@
 #!/bin/sh
-# Run the Go tests of the code the image is built from: a copy of this checkout prepared by
-# prepare-tree.sh, inside the same build image upstream's Dockerfile compiles with, so the
-# toolchain follows upstream's choice without any change here.
+# Run the Go tests of the code the image is built from - the tree prepare-tree.sh makes from the
+# committed HEAD - inside the same build image upstream's Dockerfile compiles with, so the
+# toolchain follows upstream's choice with no change here.
 #
-# Only the packages our patches touch are tested. Upstream tests its own releases; the full
-# suite here would mostly re-run that, and one flaky upstream test would block the sync.
-# Set TEST_PKGS to override, e.g. TEST_PKGS=./... to run everything.
+# Only the packages our patches touch are tested, in -short mode: upstream tests its own
+# releases, the full suite would mostly re-run that, and its container-based tests need a
+# docker socket the test container does not have. Set TEST_PKGS to override, e.g. ./...
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -21,18 +21,16 @@ if [ -z "$pkgs" ]; then
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
-git ls-files -z --cached --others --exclude-standard |
-  tar --null --ignore-failed-read -T - -cf - | tar -xf - -C "$tmp"
-sh deploy/wb-compat/prepare-tree.sh "$tmp"
+trap 'rm -rf "$tmp"; git worktree prune' EXIT INT TERM
+sh deploy/wb-compat/prepare-tree.sh "$tmp/src"
 
 builder=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' Dockerfile | head -n 1)
 echo "testing $pkgs with $builder"
 # the go build cache lives in a named volume, so a rerun recompiles only what changed
-docker run --rm -v "$tmp":/build -v tg-spam-wb-gocache:/root/.cache/go-build -w /build \
+docker run --rm -v "$tmp/src":/build -v tg-spam-wb-gocache:/root/.cache/go-build -w /build \
   -e PKGS="$pkgs" "$builder" sh -ec '
     unformatted=$(for p in $PKGS; do gofmt -l "${p%/}"/*.go; done)
     if [ -n "$unformatted" ]; then echo "not gofmt-formatted: $unformatted" >&2; exit 1; fi
     go vet $PKGS
-    go test -count=1 $PKGS
+    go test -short -count=1 $PKGS
   '
