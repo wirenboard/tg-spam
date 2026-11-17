@@ -38,6 +38,10 @@ services:
       MESSAGE_SPAM: ${MESSAGE_SPAM:-Кажется, тут был спам. Если вы человек, напишите админам и попробуйте снова.}
       MESSAGE_RESTORE: ${MESSAGE_RESTORE:-прошу прощения, принял вас за спамера. Вот ваше сообщение}
 
+      # Combot API key for the CAS check, see docker-compose.portainer.yml. Without it the
+      # check is skipped.
+      CAS_TOKEN: ${CAS_TOKEN:-}
+
       OPENAI_TOKEN: ${OPENAI_TOKEN}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
       OPENAI_VETO: ${OPENAI_VETO:-true}

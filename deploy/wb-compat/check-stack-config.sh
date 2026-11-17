@@ -36,6 +36,10 @@ if printf '%s\n' "$OUT" | grep -Eq -- '--super'; then
   fail=1
 fi
 
+# the Combot key must reach the container: without it CAS is skipped, and nothing breaks
+# loudly enough to notice
+need 'CAS_TOKEN: dummy-cas-token'
+
 # values the stack env pins
 need 'OPENAI_MODEL: gpt-5.6-sol'
 need 'MIN_PROBABILITY: "?35"?'
@@ -79,6 +83,7 @@ OUT=$(docker compose --env-file deploy/wb-compat/update-channel-test.env -f "$UC
 
 need 'image: ghcr.io/wirenboard/tg-spam:'
 need 'pull_policy: always'
+need 'CAS_TOKEN: dummy-cas-token'
 # this bot keeps its dynamic data at the volume root, mounted at /srv/var - the mount
 # point and FILES_DYNAMIC must agree or it starts on an empty database
 need 'FILES_DYNAMIC: /srv/var'

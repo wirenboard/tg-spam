@@ -57,13 +57,19 @@ services:
       MESSAGE_DRY: ${MESSAGE_DRY:-this is spam (dry mode)}
       MESSAGE_RESTORE: ${MESSAGE_RESTORE:-Прошу прощения, принял вас за спамера. Вот ваше сообщение:}
 
+      # CAS (cas.chat, the Combot anti-spam list) has answered only with a Combot API key
+      # since 2026-10-25: combot.org -> Settings -> API key, signed in with Telegram. Without
+      # it the bot skips the CAS check and says so once in the log at startup. Like every
+      # token, the value lives only in the stack environment.
+      CAS_TOKEN: ${CAS_TOKEN:-}
+
       OPENAI_TOKEN: ${OPENAI_TOKEN}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
       OPENAI_VETO: ${OPENAI_VETO:-false}
       # Messages shorter than MIN_MSG_LEN are checked by OpenAI only when this is set.
       OPENAI_CHECK_SHORT_MESSAGES: ${OPENAI_CHECK_SHORT_MESSAGES:-true}
-      # Thinking budget for reasoning models: none, low, medium or high. none turns
-      # thinking off entirely.
+      # Thinking budget for reasoning models: off, low, medium or high; none leaves the
+      # model's own default.
       OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
       # Reasoning tokens count against this limit, so a low value leaves the reply
       # truncated and the check unusable.
