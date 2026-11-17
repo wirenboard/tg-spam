@@ -97,7 +97,7 @@
     {{if .ConfigDBMode}}
     <div class="alert alert-warning py-2 mb-3 small">
         <i class="bi bi-exclamation-triangle me-1"></i>
-        Saved settings are persisted to the database. Detector and spam bot changes take effect after a restart, while auth hash and credential rotations apply immediately on the next request or after <code>/config/reload</code>.
+        Saved settings are persisted to the database. The web auth hash is re-read on every request, so it rotates immediately. Everything else, detector and spam bot settings as well as the Telegram, OpenAI and Gemini tokens, is applied to clients built once at startup and needs a restart; <code>/config/reload</code> refreshes the stored settings but does not rebuild those clients.
     </div>
     {{end}}
 
@@ -125,6 +125,11 @@
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="gemini-tab" data-bs-toggle="tab" data-bs-target="#gemini-settings" type="button" role="tab">
                     <i class="bi bi-stars me-1"></i>Gemini
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="jev-tab" data-bs-toggle="tab" data-bs-target="#jev-settings" type="button" role="tab">
+                    <i class="bi bi-sliders me-1"></i>Jev
                 </button>
             </li>
             <li class="nav-item" role="presentation">
@@ -285,7 +290,7 @@
                         <tr><th>History Size</th><td>{{.History.Size}}</td></tr>
                         <tr><th>Paranoid Mode</th><td>{{.ParanoidMode}}</td></tr>
                         <tr><th>Forward Prohibited</th><td>{{.Meta.Forward}}</td></tr>
-                        <tr><th>CAS Enabled</th><td>{{.IsCASEnabled}}</td></tr>
+                        <tr><th>CAS Enabled</th><td>{{.IsCASEnabled}}{{if and .IsCASEnabled (not .CAS.Token)}} (inactive, no token){{end}}</td></tr>
                         <tr><th>Duplicates Threshold</th><td>{{if eq .Duplicates.Threshold 0}}disabled{{else}}{{.Duplicates.Threshold}}{{end}}</td></tr>
                         <tr><th>Duplicates Window</th><td>{{.Duplicates.Window}}</td></tr>
                         <tr><th>Reactions Max Count</th><td>{{if eq .Reactions.MaxReactions 0}}disabled{{else}}{{.Reactions.MaxReactions}}{{end}}</td></tr>
@@ -357,6 +362,10 @@
                         <label class="form-check-label" for="metaAudioOnly">Meta Audio Only</label>
                     </div>
                     <div class="form-check form-switch mt-2">
+                        <input class="form-check-input" type="checkbox" id="metaDocumentOnly" name="metaDocumentOnly" {{if .Meta.DocumentsOnly}}checked{{end}}>
+                        <label class="form-check-label" for="metaDocumentOnly">Meta Document Only</label>
+                    </div>
+                    <div class="form-check form-switch mt-2">
                         <input class="form-check-input" type="checkbox" id="metaKeyboard" name="metaKeyboard" {{if .Meta.Keyboard}}checked{{end}}>
                         <label class="form-check-label" for="metaKeyboard">Meta Keyboard</label>
                     </div>
@@ -382,6 +391,7 @@
                         <tr><th>Meta Image Text Len</th><td>{{if eq .Meta.ImageTextLen 0}}min-msg-len{{else}}{{.Meta.ImageTextLen}}{{end}}</td></tr>
                         <tr><th>Meta Video Only</th><td>{{.Meta.VideosOnly}}</td></tr>
                         <tr><th>Meta Audio Only</th><td>{{.Meta.AudiosOnly}}</td></tr>
+                        <tr><th>Meta Document Only</th><td>{{.Meta.DocumentsOnly}}</td></tr>
                         <tr><th>Meta Keyboard</th><td>{{.Meta.Keyboard}}</td></tr>
                         <tr><th>Meta External Reply</th><td>{{.Meta.ExternalReply}}</td></tr>
                         <tr><th>Meta Contact Only</th><td>{{.Meta.ContactOnly}}</td></tr>
@@ -508,6 +518,103 @@
                                 {{end}}
                             {{end}}
                         </td></tr>
+                    </tbody>
+                </table>
+            </div>
+            {{end}}
+        </div>
+
+        <!-- Jev Settings -->
+        <div class="tab-pane fade" id="jev-settings" role="tabpanel">
+            {{if .ConfigDBMode}}
+            <div class="row mb-3">
+                <div class="col-md-6 mb-3">
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="jevVeto" name="jevVeto" {{if .Jev.Veto}}checked{{end}}>
+                        <label class="form-check-label" for="jevVeto">Jev Veto</label>
+                    </div>
+                    <div class="form-check form-switch mt-2">
+                        <input class="form-check-input" type="checkbox" id="jevCheckShortMessages" name="jevCheckShortMessages" {{if .Jev.CheckShortMessages}}checked{{end}}>
+                        <label class="form-check-label" for="jevCheckShortMessages">Check Short Messages</label>
+                    </div>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="jevHistorySize" class="form-label">Jev History Size</label>
+                    <input type="number" min="0" class="form-control" id="jevHistorySize" name="jevHistorySize" value="{{.Jev.HistorySize}}">
+                    <div class="form-text">Number of messages to include in Jev context</div>
+                </div>
+            </div>
+
+            <div class="row mb-3">
+                <div class="col-md-6 mb-3">
+                    <label for="jevModel" class="form-label">Jev Model</label>
+                    <input type="text" class="form-control" id="jevModel" name="jevModel" value="{{.Jev.Model}}">
+                    <div class="form-text">Pinned model version, never an alias: an alias moves and silently changes the threshold's meaning</div>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="jevThreshold" class="form-label">Jev Threshold</label>
+                    <input type="number" step="any" min="0" max="1" class="form-control" id="jevThreshold" name="jevThreshold" value="{{.Jev.Threshold}}">
+                    <div class="form-text">Spam probability at or above this is spam, in (0, 1]. Start at 0.30. Raise it to reduce false positives; lower it toward 0.25 to catch more potential spam. Lower values can flag more legitimate messages. Check the results in your chat</div>
+                </div>
+            </div>
+
+            <div class="row mb-3">
+                <div class="col-md-6 mb-3">
+                    <label for="jevGibberishThreshold" class="form-label">Jev Gibberish Threshold</label>
+                    <input type="number" step="any" min="0" max="1" class="form-control" id="jevGibberishThreshold" name="jevGibberishThreshold" value="{{.Jev.GibberishThreshold}}">
+                    <div class="form-text">Flags messages made of random letter groups, like "dsfg dfgh ewrt", when the gibberish probability is at or above this, in [0, 1]. 0 turns it off. Start at 0.50. Requires Jev History Size 0. Not applied to messages with quoted or replied-to text</div>
+                </div>
+            </div>
+
+            <div class="row mb-3">
+                <div class="col-md-6 mb-3">
+                    <label for="jevRetryCount" class="form-label">Jev Retry Count</label>
+                    <input type="number" min="1" class="form-control" id="jevRetryCount" name="jevRetryCount" value="{{.Jev.RetryCount}}">
+                    <div class="form-text">Total attempts, not retries after the first</div>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="jevMaxSymbolsRequest" class="form-label">Jev Max Symbols Request</label>
+                    <input type="number" min="0" class="form-control" id="jevMaxSymbolsRequest" name="jevMaxSymbolsRequest" value="{{.Jev.MaxSymbolsRequest}}">
+                    <div class="form-text">Max request length in runes, 0 uses the default</div>
+                </div>
+            </div>
+
+            <div class="row mb-3">
+                <div class="col-12 mb-3">
+                    <label for="jevQuestion" class="form-label">Jev Question</label>
+                    <textarea class="form-control" id="jevQuestion" name="jevQuestion" rows="2">{{.Jev.Question}}</textarea>
+                    <div class="form-text">The single question asked of the model. Changing it invalidates the evaluated threshold</div>
+                </div>
+                <div class="col-12 mb-3">
+                    <label for="jevCriteriaSpam" class="form-label">Jev Criteria: Spam</label>
+                    <textarea class="form-control" id="jevCriteriaSpam" name="jevCriteriaSpam" rows="4">{{.Jev.CriteriaSpam}}</textarea>
+                    <div class="form-text">What counts as spam. Must not be empty</div>
+                </div>
+                <div class="col-12 mb-3">
+                    <label for="jevCriteriaHam" class="form-label">Jev Criteria: Ham</label>
+                    <textarea class="form-control" id="jevCriteriaHam" name="jevCriteriaHam" rows="4">{{.Jev.CriteriaHam}}</textarea>
+                    <div class="form-text">What counts as ordinary conversation. Must not be empty</div>
+                </div>
+            </div>
+            {{else}}
+            <div class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <thead class="custom-table-header">
+                        <tr><th colspan="2">Jev Integration Settings</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><th style="width: 30%">Jev Enabled</th><td>{{.JevEnabled}}</td></tr>
+                        <tr><th>Jev Veto</th><td>{{.Jev.Veto}}</td></tr>
+                        <tr><th>Jev History Size</th><td>{{.Jev.HistorySize}}</td></tr>
+                        <tr><th>Jev Model</th><td>{{.Jev.Model}}</td></tr>
+                        <tr><th>Jev Threshold</th><td>{{.Jev.Threshold}}</td></tr>
+                        <tr><th>Jev Gibberish Threshold</th><td>{{.Jev.GibberishThreshold}}</td></tr>
+                        <tr><th>Jev Retry Count</th><td>{{.Jev.RetryCount}}</td></tr>
+                        <tr><th>Jev Max Symbols Request</th><td>{{.Jev.MaxSymbolsRequest}}</td></tr>
+                        <tr><th>Check Short Messages</th><td>{{.Jev.CheckShortMessages}}</td></tr>
+                        <tr><th>Jev Question</th><td>{{.Jev.Question}}</td></tr>
+                        <tr><th>Jev Criteria: Spam</th><td>{{.Jev.CriteriaSpam}}</td></tr>
+                        <tr><th>Jev Criteria: Ham</th><td>{{.Jev.CriteriaHam}}</td></tr>
                     </tbody>
                 </table>
             </div>

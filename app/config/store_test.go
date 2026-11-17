@@ -180,6 +180,92 @@ func (s *SettingsTestSuite) TestStore_SaveLoad() {
 	}
 }
 
+func (s *SettingsTestSuite) TestStore_Save_KeepsCLICredentialsOutOfDB() {
+	rawData := func(db *engine.SQL) string {
+		var data string
+		err := db.GetContext(s.ctx, &data, db.Adopt("SELECT data FROM config WHERE gid = ?"), db.GID())
+		s.Require().NoError(err)
+		return data
+	}
+
+	for _, db := range s.getTestDB() {
+		s.Run(fmt.Sprintf("no stored row, cli credential is not written, with %s", db.Type()), func() {
+			s.SetupTest()
+			store, err := NewStore(s.ctx, db)
+			s.Require().NoError(err)
+
+			settings := New()
+			settings.Jev.Token = "cli-jev-token"
+			settings.OpenAI.Token = "db-openai-token"
+			settings.Transient.CredentialsFromCLI = []string{FieldJevToken}
+			s.Require().NoError(store.Save(s.ctx, settings))
+
+			s.NotContains(rawData(db), "cli-jev-token")
+			loaded, err := store.Load(s.ctx)
+			s.Require().NoError(err)
+			s.Empty(loaded.Jev.Token)
+			s.Equal("db-openai-token", loaded.OpenAI.Token, "credentials not supplied on the cli are saved as before")
+			s.Equal("cli-jev-token", settings.Jev.Token, "the caller's in-memory value is untouched")
+		})
+
+		s.Run(fmt.Sprintf("stored value is kept, other changes are saved, with %s", db.Type()), func() {
+			s.SetupTest()
+			store, err := NewStore(s.ctx, db)
+			s.Require().NoError(err)
+
+			initial := New()
+			initial.Telegram.Token = "db-telegram-token"
+			s.Require().NoError(store.Save(s.ctx, initial))
+
+			settings := New()
+			settings.Telegram.Token = "cli-telegram-token"
+			settings.Message.Spam = "updated spam message"
+			settings.Transient.CredentialsFromCLI = []string{FieldTelegramToken}
+			s.Require().NoError(store.Save(s.ctx, settings))
+
+			s.NotContains(rawData(db), "cli-telegram-token")
+			loaded, err := store.Load(s.ctx)
+			s.Require().NoError(err)
+			s.Equal("db-telegram-token", loaded.Telegram.Token)
+			s.Equal("updated spam message", loaded.Message.Spam)
+		})
+
+		s.Run(fmt.Sprintf("encrypted stored value is kept, with %s", db.Type()), func() {
+			s.SetupTest()
+			crypter, err := NewCrypter("test-master-key-that-is-long-enough", "test-instance")
+			s.Require().NoError(err)
+			store, err := NewStore(s.ctx, db, WithCrypter(crypter))
+			s.Require().NoError(err)
+
+			initial := New()
+			initial.Server.AuthHash = "db-auth-hash"
+			s.Require().NoError(store.Save(s.ctx, initial))
+
+			settings := New()
+			settings.Server.AuthHash = "cli-auth-hash"
+			settings.Transient.CredentialsFromCLI = []string{FieldServerAuthHash}
+			s.Require().NoError(store.Save(s.ctx, settings))
+
+			raw := rawData(db)
+			s.NotContains(raw, "cli-auth-hash")
+			s.NotContains(raw, "db-auth-hash", "stored value stays encrypted")
+			loaded, err := store.Load(s.ctx)
+			s.Require().NoError(err)
+			s.Equal("db-auth-hash", loaded.Server.AuthHash)
+		})
+
+		s.Run(fmt.Sprintf("unknown field is rejected, with %s", db.Type()), func() {
+			s.SetupTest()
+			store, err := NewStore(s.ctx, db)
+			s.Require().NoError(err)
+
+			settings := New()
+			settings.Transient.CredentialsFromCLI = []string{"no.such.field"}
+			s.Require().Error(store.Save(s.ctx, settings))
+		})
+	}
+}
+
 func (s *SettingsTestSuite) TestStore_SaveNilSettings() {
 	for _, db := range s.getTestDB() {
 		s.Run(fmt.Sprintf("with %s", db.Type()), func() {
@@ -214,6 +300,39 @@ func (s *SettingsTestSuite) TestStore_LoadError() {
 			_, err = store.Load(s.ctx)
 			s.Require().Error(err)
 			s.Contains(err.Error(), "failed to unmarshal settings")
+		})
+	}
+}
+
+func (s *SettingsTestSuite) TestStore_WithDefaults() {
+	tmpl := New()
+	tmpl.InstanceID = "tmpl-instance"
+	tmpl.Meta.LinksLimit = -1
+	tmpl.Meta.MentionsLimit = -1
+	tmpl.MaxEmoji = 2
+	tmpl.Admin.SuperUsers = make([]string, 1, 4)
+	tmpl.Admin.SuperUsers[0] = "tmpl-admin"
+
+	for _, db := range s.getTestDB() {
+		s.Run(fmt.Sprintf("with %s", db.Type()), func() {
+			s.SetupTest()
+			store, err := NewStore(s.ctx, db, WithDefaults(tmpl))
+			s.Require().NoError(err)
+
+			query := db.Adopt("INSERT INTO config (gid, data) VALUES (?, ?)")
+			_, err = db.Exec(query, db.GID(), `{"meta":{"links_limit":0},"admin":{"super_users":["a","b"]}}`)
+			s.Require().NoError(err)
+
+			for range 2 {
+				loaded, err := store.Load(s.ctx)
+				s.Require().NoError(err)
+				s.Equal(0, loaded.Meta.LinksLimit, "explicit zero kept")
+				s.Equal(-1, loaded.Meta.MentionsLimit, "omitted key takes the default")
+				s.Equal(2, loaded.MaxEmoji, "omitted key takes the default")
+				s.Equal([]string{"a", "b"}, loaded.Admin.SuperUsers)
+				s.Empty(loaded.InstanceID, "instance id is never seeded")
+			}
+			s.Equal([]string{"tmpl-admin"}, tmpl.Admin.SuperUsers, "template untouched by loads")
 		})
 	}
 }

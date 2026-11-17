@@ -79,8 +79,8 @@ func (s *Server) loadConfigHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// reapply startup-equivalent normalization: fills any zero fields left by a
-	// partial/legacy DB blob from the defaults template and reasserts operator-
+	// reapply startup-equivalent normalization: refills stored zeros from the
+	// defaults template (except zero-aware fields) and reasserts operator-
 	// supplied operational CLI overrides (--files.dynamic, --files.samples,
 	// --server.listen, --dry) so reload doesn't silently revert them to DB values.
 	// run BEFORE transient/auth preservation so the closure can't accidentally
@@ -89,15 +89,26 @@ func (s *Server) loadConfigHandler(w http.ResponseWriter, r *http.Request) {
 		s.ReloadNormalize(settings)
 	}
 
-	// preserve transient settings (never stored in DB). Tokens are NOT preserved:
-	// in --confdb mode the DB is authoritative for Telegram/OpenAI/Gemini tokens,
-	// so reload must pick up fresh DB values. Auth hash is preserved only when
-	// transient.AuthFromCLI is set, which marks an in-memory hash that must
-	// survive reload (set by applyCLIOverrides for explicit --server.auth/-hash
-	// flags, and by applyAutoAuthFallback for the auto-generated safety net).
-	// when auth originated from the DB, fresh DB values win so external hash
-	// rotations are picked up.
+	// preserve transient settings (never stored in DB). Tokens stored in the DB are
+	// NOT preserved: in --confdb mode the DB is authoritative for them, so reload
+	// must pick up fresh DB values. picking them up only refreshes the settings
+	// struct though: the Telegram bot API client and every LLM provider client are
+	// built once in main and are not rebuilt here, so a rotated service token
+	// reaches them only after a restart. Credentials supplied on the command line
+	// (transient.CredentialsFromCLI) are never written to the DB, so they are kept
+	// from memory. Auth hash is also preserved when transient.AuthFromCLI is set,
+	// which marks an in-memory hash that must survive reload (set by
+	// applyCLIOverrides for explicit --server.auth/-hash flags, and by
+	// applyAutoAuthFallback for the auto-generated safety net). when auth
+	// originated from the DB, fresh DB values win so external hash rotations are
+	// picked up.
 	settings.Transient = s.AppSettings.Transient
+	if err := config.CopySensitiveFields(settings, s.AppSettings, s.AppSettings.Transient.CredentialsFromCLI...); err != nil {
+		s.appSettingsMu.Unlock()
+		log.Printf("[ERROR] failed to keep command-line credentials on reload: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to load configuration: %v", err), http.StatusInternalServerError)
+		return
+	}
 	if s.AppSettings.Transient.AuthFromCLI {
 		settings.Server.AuthHash = s.AppSettings.Server.AuthHash
 	}
@@ -290,19 +301,19 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 
 	// meta checks: server-side authoritative master toggle. Behavior:
 	//   - form contains zero meta-related fields → skip the entire block so
-	//     unrelated saves preserve all 13 IsMetaEnabled-contributing fields
+	//     unrelated saves preserve all 14 IsMetaEnabled-contributing fields
 	//   - metaEnabled=on → write rendered fields from form; rendered booleans
 	//     follow presence-of-on (absent == unchecked == false), unrendered
 	//     booleans (metaContactOnly, metaGiveaway) and the optional
 	//     metaUsernameSymbols are gated on r.Form presence so submits without
 	//     them preserve existing values
-	//   - metaEnabled absent → master toggle off, clear ALL 13 fields used by
+	//   - metaEnabled absent → master toggle off, clear ALL 14 fields used by
 	//     isMetaEnabled() so a checked per-feature box (e.g., metaImageOnly)
 	//     cannot keep meta enabled
 	metaFormFields := []string{
 		"metaEnabled", "metaLinksLimit", "metaMentionsLimit", "metaUsernameSymbols",
 		"metaImageTextLen",
-		"metaLinksOnly", "metaMentionOnly", "metaImageOnly", "metaVideoOnly", "metaAudioOnly",
+		"metaLinksOnly", "metaMentionOnly", "metaImageOnly", "metaVideoOnly", "metaDocumentOnly", "metaAudioOnly",
 		"metaForwarded", "metaKeyboard", "metaContactOnly", "metaGiveaway", "metaExternalReply",
 	}
 	hasMetaForm := false
@@ -340,6 +351,7 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 			settings.Meta.MentionOnly = r.FormValue("metaMentionOnly") == "on"
 			settings.Meta.ImageOnly = r.FormValue("metaImageOnly") == "on"
 			settings.Meta.VideosOnly = r.FormValue("metaVideoOnly") == "on"
+			settings.Meta.DocumentsOnly = r.FormValue("metaDocumentOnly") == "on"
 			settings.Meta.AudiosOnly = r.FormValue("metaAudioOnly") == "on"
 			settings.Meta.Forward = r.FormValue("metaForwarded") == "on"
 			settings.Meta.Keyboard = r.FormValue("metaKeyboard") == "on"
@@ -363,6 +375,7 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 			settings.Meta.MentionOnly = false
 			settings.Meta.ImageOnly = false
 			settings.Meta.VideosOnly = false
+			settings.Meta.DocumentsOnly = false
 			settings.Meta.AudiosOnly = false
 			settings.Meta.Forward = false
 			settings.Meta.Keyboard = false
@@ -421,6 +434,59 @@ func updateSettingsFromForm(settings *config.Settings, r *http.Request) {
 	if val := r.FormValue("geminiRetryCount"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil {
 			settings.Gemini.RetryCount = n
+		}
+	}
+
+	// jev settings (mirror gemini handling; do not touch Jev.Token from form - credential lives in CLI/DB only).
+	// a malformed number leaves the stored value in place; a parseable but invalid one (NaN, out of
+	// range, negative cap) is stored and then rejected by Validate, which rolls the whole update back
+	// so the operator sees why instead of having the field silently ignored.
+	settings.Jev.Veto = r.FormValue("jevVeto") == "on"
+	settings.Jev.CheckShortMessages = r.FormValue("jevCheckShortMessages") == "on"
+
+	if val := r.FormValue("jevHistorySize"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			settings.Jev.HistorySize = n
+		}
+	}
+
+	if val := r.FormValue("jevModel"); val != "" {
+		settings.Jev.Model = val
+	}
+
+	if _, ok := r.Form["jevQuestion"]; ok {
+		settings.Jev.Question = r.FormValue("jevQuestion")
+	}
+
+	if _, ok := r.Form["jevCriteriaSpam"]; ok {
+		settings.Jev.CriteriaSpam = r.FormValue("jevCriteriaSpam")
+	}
+
+	if _, ok := r.Form["jevCriteriaHam"]; ok {
+		settings.Jev.CriteriaHam = r.FormValue("jevCriteriaHam")
+	}
+
+	if val := r.FormValue("jevThreshold"); val != "" {
+		if th, err := strconv.ParseFloat(val, 64); err == nil {
+			settings.Jev.Threshold = th
+		}
+	}
+
+	if val := r.FormValue("jevGibberishThreshold"); val != "" {
+		if th, err := strconv.ParseFloat(val, 64); err == nil {
+			settings.Jev.GibberishThreshold = th
+		}
+	}
+
+	if val := r.FormValue("jevMaxSymbolsRequest"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			settings.Jev.MaxSymbolsRequest = n
+		}
+	}
+
+	if val := r.FormValue("jevRetryCount"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			settings.Jev.RetryCount = n
 		}
 	}
 

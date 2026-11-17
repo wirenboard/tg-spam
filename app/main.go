@@ -79,6 +79,7 @@ type options struct {
 
 	CAS struct {
 		API       string        `long:"api" env:"API" default:"https://api.cas.chat" description:"CAS API"`
+		Token     string        `long:"token" env:"TOKEN" description:"CAS API token (Combot API key), disabled if not set"`
 		Timeout   time.Duration `long:"timeout" env:"TIMEOUT" default:"5s" description:"CAS timeout"`
 		UserAgent string        `long:"user-agent" env:"USER_AGENT" description:"User-Agent header for CAS API requests"`
 	} `group:"cas" namespace:"cas" env-namespace:"CAS"`
@@ -91,6 +92,7 @@ type options struct {
 		LinksOnly       bool   `long:"links-only" env:"LINKS_ONLY" description:"enable links only check"`
 		MentionOnly     bool   `long:"mention-only" env:"MENTION_ONLY" description:"enable mention only check"`
 		VideosOnly      bool   `long:"video-only" env:"VIDEO_ONLY" description:"enable video only check"`
+		DocumentsOnly   bool   `long:"document-only" env:"DOCUMENT_ONLY" description:"enable document only check"`
 		AudiosOnly      bool   `long:"audio-only" env:"AUDIO_ONLY" description:"enable audio only check"`
 		ContactOnly     bool   `long:"contact-only" env:"CONTACT_ONLY" description:"enable contact only check"`
 		Forward         bool   `long:"forward" env:"FORWARD" description:"enable forward check"`
@@ -112,7 +114,7 @@ type options struct {
 		MaxSymbolsRequest  int      `long:"max-symbols-request" env:"MAX_SYMBOLS_REQUEST" default:"16000" description:"openai max symbols in request, failback if tokenizer failed"`
 		RetryCount         int      `long:"retry-count" env:"RETRY_COUNT" default:"1" description:"openai retry count"`
 		HistorySize        int      `long:"history-size" env:"HISTORY_SIZE" default:"0" description:"openai history size"`
-		ReasoningEffort    string   `long:"reasoning-effort" env:"REASONING_EFFORT" default:"none" choice:"none" choice:"low" choice:"medium" choice:"high" description:"reasoning effort for thinking models, none disables thinking"`
+		ReasoningEffort    string   `long:"reasoning-effort" env:"REASONING_EFFORT" default:"none" choice:"none" choice:"off" choice:"low" choice:"medium" choice:"high" description:"reasoning effort for thinking models, none leaves the model default, off disables thinking"`
 		CheckShortMessages bool     `long:"check-short-messages" env:"CHECK_SHORT_MESSAGES" description:"check messages shorter than min-msg-len with OpenAI"`
 	} `group:"openai" namespace:"openai" env-namespace:"OPENAI"`
 
@@ -129,6 +131,22 @@ type options struct {
 		CheckShortMessages bool     `long:"check-short-messages" env:"CHECK_SHORT_MESSAGES" description:"check messages shorter than min-msg-len with Gemini"`
 	} `group:"gemini" namespace:"gemini" env-namespace:"GEMINI"`
 
+	Jev struct {
+		Token              string  `long:"token" env:"TOKEN" description:"jev token, disabled if not set"`
+		APIBase            string  `long:"apibase" env:"API_BASE" description:"custom jev API base"`
+		Veto               bool    `long:"veto" env:"VETO" description:"veto mode, confirm detected spam"`
+		Model              string  `long:"model" env:"MODEL" default:"jev-1.13.0" description:"jev model, pinned version not an alias"`
+		Question           string  "long:\"question\" env:\"QUESTION\" default:\"Is `message`, posted in a public Telegram group chat, spam?\" description:\"jev spam question\""
+		CriteriaSpam       string  `long:"criteria-spam" env:"CRITERIA_SPAM" default:"It promotes, advertises, or offers paid services, paid subscriptions, paid content, donations, crypto wallets, paid promotion of content or accounts, job recruitment, hiring, looking for employees, unsolicited job postings, easy money offers, work-from-home offers with specific payment amounts, VPN promotion, or invitations to join Telegram bots or channels for earnings." description:"jev criteria for spam"`
+		CriteriaHam        string  `long:"criteria-ham" env:"CRITERIA_HAM" default:"Ordinary conversation between chat members. Casual discussion or mentioning prices of well-known services and products such as GitHub Copilot, ChatGPT Plus, cloud providers or software tools is NOT spam. Off-topic banter, rudeness, profanity, questions, and links shared as part of a conversation are NOT spam. Only direct selling, promoting, or advertising counts as spam." description:"jev criteria for ham"`
+		Threshold          float64 `long:"threshold" env:"THRESHOLD" default:"0.30" description:"spam probability at or above this is spam"`
+		MaxSymbolsRequest  int     `long:"max-symbols-request" env:"MAX_SYMBOLS_REQUEST" default:"6000" description:"jev max symbols in request"`
+		RetryCount         int     `long:"retry-count" env:"RETRY_COUNT" default:"1" description:"jev retry count"`
+		HistorySize        int     `long:"history-size" env:"HISTORY_SIZE" default:"0" description:"jev history size"`
+		CheckShortMessages bool    `long:"check-short-messages" env:"CHECK_SHORT_MESSAGES" description:"check messages shorter than min-msg-len with jev"`
+		GibberishThreshold float64 `long:"gibberish-threshold" env:"GIBBERISH_THRESHOLD" default:"0" description:"gibberish probability at or above this is spam, 0 disables"`
+	} `group:"jev" namespace:"jev" env-namespace:"JEV"`
+
 	LLM struct {
 		Consensus      string        `long:"consensus" env:"CONSENSUS" choice:"any" choice:"all" default:"any" description:"how eligible LLMs flip the base decision"`
 		RequestTimeout time.Duration `long:"request-timeout" env:"REQUEST_TIMEOUT" default:"30s" description:"timeout for individual LLM requests"`
@@ -139,6 +157,7 @@ type options struct {
 		PluginsDir     string   `long:"plugins-dir" env:"PLUGINS_DIR" description:"directory with Lua plugins"`
 		EnabledPlugins []string `long:"enabled-plugins" env:"ENABLED_PLUGINS" env-delim:"," description:"list of enabled plugins (by name, without .lua extension)"`
 		DynamicReload  bool     `long:"dynamic-reload" env:"DYNAMIC_RELOAD" description:"dynamically reload plugins when they change"`
+		Unrestricted   bool     `long:"unrestricted" env:"UNRESTRICTED" description:"give plugins every Lua library, os and io included"`
 	} `group:"lua-plugins" namespace:"lua-plugins" env-namespace:"LUA_PLUGINS"`
 
 	AbnormalSpacing struct {
@@ -198,7 +217,6 @@ type options struct {
 		Spam    string `long:"spam" env:"SPAM" default:"this is spam" description:"spam message"`
 		Dry     string `long:"dry" env:"DRY" default:"this is spam (dry mode)" description:"spam dry message"`
 		Warn    string `long:"warn" env:"WARN" default:"You've violated our rules and this is your first and last warning. Further violations will lead to permanent access denial. Stay compliant or face the consequences!" description:"warning message"`
-		Restore string `long:"restore" env:"RESTORE" default:"" description:"restore message"`
 	} `group:"message" namespace:"message" env-namespace:"MESSAGE"`
 
 	Server struct {
@@ -301,6 +319,7 @@ func main() {
 		appSettings.Transient.Dbg = opts.Dbg
 		appSettings.Transient.TGDbg = opts.TGDbg
 		appSettings.Transient.StorageTimeout = opts.StorageTimeout
+		appSettings.Transient.LuaUnrestricted = opts.LuaPlugins.Unrestricted
 
 		// apply explicit CLI overrides for non-transient values
 		applyCLIOverrides(appSettings, opts, defaults)
@@ -323,42 +342,19 @@ func main() {
 	// setup logger with masked secrets BEFORE any subcommand dispatch so any
 	// error wrapping inside saveConfigToDB or later stages benefits from the
 	// secret masker. Tokens come directly from the resolved domain settings.
-	masked := []string{}
-
-	if appSettings.Telegram.Token != "" {
-		masked = append(masked, appSettings.Telegram.Token)
-	}
-	if appSettings.OpenAI.Token != "" {
-		masked = append(masked, appSettings.OpenAI.Token)
-	}
-	if appSettings.Gemini.Token != "" {
-		masked = append(masked, appSettings.Gemini.Token)
-	}
-
-	// add temporary web password if not "auto"
-	if appSettings.Transient.WebAuthPasswd != "auto" && appSettings.Transient.WebAuthPasswd != "" {
-		// auto passwd should not be masked as we print it
-		masked = append(masked, appSettings.Transient.WebAuthPasswd)
-	}
-
-	// add auth hash
-	if appSettings.Server.AuthHash != "" {
-		masked = append(masked, appSettings.Server.AuthHash)
-	}
-
-	// add config DB encryption master key - must be masked before the %+v settings dump below
-	if appSettings.Transient.ConfigDBEncryptKey != "" {
-		masked = append(masked, appSettings.Transient.ConfigDBEncryptKey)
-	}
-
-	setupLog(appSettings.Transient.Dbg, masked...)
+	setupLog(appSettings.Transient.Dbg, collectMaskedSecrets(appSettings)...)
 
 	// handle save-config command (after setupLog so any error output is masked)
 	if p.Active != nil && p.Active.Name == "save-config" {
 		os.Exit(runSaveConfig(appSettings))
 	}
 
-	log.Printf("[DEBUG] settings: %+v", appSettings)
+	// dump a copy with the database credentials masked; the live settings keep the original URL
+	// because that is what gets handed to the driver. masking through setupLog would not work here,
+	// as the secret masker matches literal substrings and the URL may hold a percent-encoded password
+	dumpSettings := *appSettings
+	dumpSettings.Transient.DataBaseURL = engine.RedactConnURL(appSettings.Transient.DataBaseURL)
+	log.Printf("[DEBUG] settings: %+v", &dumpSettings)
 
 	if err := appSettings.Validate(); err != nil {
 		log.Fatalf("[ERROR] %v", err)
@@ -522,7 +518,6 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		Bot:                 spamBot,
 		StartupMsg:          settings.Message.Startup,
 		WarnMsg:             settings.Message.Warn,
-		RestoreMsg:          settings.Message.Restore,
 		NoSpamReply:         settings.NoSpamReply,
 		SuppressJoinMessage: settings.SuppressJoinMessage,
 		DeleteJoinMessages:  settings.Delete.JoinMessages,
@@ -548,6 +543,7 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		WarnThreshold:           settings.Warn.Threshold,
 		WarnWindow:              settings.Warn.Window,
 		Warnings:                warningsStore,
+		AdmitDocuments:          settings.Meta.DocumentsOnly,
 	}
 
 	if settings.Delete.JoinMessages {
@@ -589,11 +585,11 @@ func makeDB(ctx context.Context, settings *config.Settings) (*engine.SQL, error)
 	if !strings.Contains(dbURL, "/") && !strings.Contains(dbURL, "\\") {
 		dbURL = filepath.Join(settings.Files.DynamicDataPath, dbURL)
 	}
-	log.Printf("[DEBUG] data db: %s", dbURL)
+	log.Printf("[DEBUG] data db: %s", engine.RedactConnURL(dbURL))
 
 	db, err := engine.New(ctx, dbURL, settings.InstanceID)
 	if err != nil {
-		return nil, fmt.Errorf("can't make db %s, %w", settings.Transient.DataBaseURL, err)
+		return nil, fmt.Errorf("can't make db %s, %w", engine.RedactConnURL(settings.Transient.DataBaseURL), err)
 	}
 
 	// backup db on version change for sqlite
@@ -691,17 +687,9 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	// create settings store for database access if config DB mode is enabled
 	var settingsStore *config.Store
 	if settings.Transient.ConfigDB {
-		var storeOpts []config.StoreOption
-		if settings.Transient.ConfigDBEncryptKey != "" {
-			crypter, cryptErr := config.NewCrypter(settings.Transient.ConfigDBEncryptKey, settings.InstanceID)
-			if cryptErr != nil {
-				return fmt.Errorf("invalid encryption key for settings store: %w", cryptErr)
-			}
-			storeOpts = append(storeOpts, config.WithCrypter(crypter))
-		}
-		store, err := config.NewStore(ctx, db, storeOpts...)
+		store, err := makeSettingsStore(ctx, db, settings)
 		if err != nil {
-			return fmt.Errorf("failed to create settings store: %w", err)
+			return err
 		}
 		settingsStore = store
 	}
@@ -744,9 +732,39 @@ func activateServer(ctx context.Context, settings *config.Settings, sf *bot.Spam
 	return nil
 }
 
+// collectMaskedSecrets gathers every value setupLog must redact from log output. A credential
+// missing from this list is printed in clear by the %+v settings dump below it.
+func collectMaskedSecrets(appSettings *config.Settings) []string {
+	// ORDER MATTERS. lgr.hideSecrets calls bytes.ReplaceAll once per secret in slice order, so a
+	// longer secret must come before any shorter secret it contains, or only the shorter part is
+	// redacted: masking an encrypt key "k" before a password "k-9" leaves "******-9" in the log.
+	// The web password stays ahead of the auth hash and the encrypt key for exactly that reason.
+	masked := []string{}
+	add := func(secret string) {
+		if secret != "" {
+			masked = append(masked, secret)
+		}
+	}
+	add(appSettings.Telegram.Token)
+	add(appSettings.OpenAI.Token)
+	add(appSettings.Gemini.Token)
+	add(appSettings.Jev.Token)
+	add(appSettings.CAS.Token)
+	// the auto-generated password is printed for the operator, so it is not masked
+	if appSettings.Transient.WebAuthPasswd != "auto" {
+		add(appSettings.Transient.WebAuthPasswd)
+	}
+	add(appSettings.Server.AuthHash)
+	add(appSettings.Transient.ConfigDBEncryptKey)
+	return masked
+}
+
 // makeDetector creates spam detector with all checkers and updaters
 // it loads samples and dynamic files
 func makeDetector(settings *config.Settings) *tgspam.Detector {
+	if settings.IsCASEnabled() && settings.CAS.Token == "" {
+		log.Printf("[WARN] CAS check disabled: CAS API requires a token, set --cas.token or CAS_TOKEN to your Combot API key")
+	}
 	detectorConfig := tgspam.Config{
 		MaxAllowedEmoji:     settings.MaxEmoji,
 		MinMsgLen:           settings.MinMsgLen,
@@ -754,10 +772,13 @@ func makeDetector(settings *config.Settings) *tgspam.Detector {
 		SimilarityThreshold: settings.SimilarityThreshold,
 		MinSpamProbability:  settings.MinSpamProbability,
 		CasAPI:              settings.CAS.API,
+		CasToken:            settings.CAS.Token,
 		CasUserAgent:        settings.CAS.UserAgent,
 		HTTPClient:          &http.Client{Timeout: settings.CAS.Timeout},
 		FirstMessageOnly:    !settings.ParanoidMode,
 		FirstMessagesCount:  settings.FirstMessagesCount,
+		JevVeto:             settings.Jev.Veto,
+		JevHistorySize:      settings.Jev.HistorySize,
 		OpenAIVeto:          settings.OpenAI.Veto,
 		OpenAIHistorySize:   settings.OpenAI.HistorySize, // how many last requests sent to openai
 		GeminiVeto:          settings.Gemini.Veto,
@@ -859,6 +880,29 @@ func makeDetector(settings *config.Settings) *tgspam.Detector {
 		detector.WithGeminiChecker(client.Models, geminiConfig)
 	}
 
+	if settings.IsJevEnabled() {
+		log.Printf("[WARN] jev enabled")
+		jevConfig := tgspam.JevConfig{
+			Token:              settings.Jev.Token,
+			APIBase:            settings.Jev.APIBase,
+			Model:              settings.Jev.Model,
+			Question:           settings.Jev.Question,
+			CriteriaSpam:       settings.Jev.CriteriaSpam,
+			CriteriaHam:        settings.Jev.CriteriaHam,
+			Threshold:          settings.Jev.Threshold,
+			MaxSymbolsRequest:  settings.Jev.MaxSymbolsRequest,
+			RetryCount:         settings.Jev.RetryCount,
+			CheckShortMessages: settings.Jev.CheckShortMessages,
+			GibberishThreshold: settings.Jev.GibberishThreshold,
+		}
+		// jev gets its own client: Config.HTTPClient carries settings.CAS.Timeout, which would
+		// impose a CAS deadline on LLM calls. The per-request deadline comes from the detector's
+		// LLM context, threaded through NewRequestWithContext.
+		if err := detector.WithJevChecker(&http.Client{}, jevConfig); err != nil {
+			log.Fatalf("[ERROR] %v", err)
+		}
+	}
+
 	if settings.AbnormalSpace.Enabled {
 		log.Printf("[INFO] words spacing check enabled")
 		detector.AbnormalSpacing.Enabled = true
@@ -884,6 +928,10 @@ func makeDetector(settings *config.Settings) *tgspam.Detector {
 	if settings.Meta.AudiosOnly {
 		log.Printf("[INFO] audio only check enabled, min text len: %d", settings.MinMsgLen)
 		metaChecks = append(metaChecks, tgspam.AudioCheck(settings.MinMsgLen))
+	}
+	if settings.Meta.DocumentsOnly {
+		log.Printf("[INFO] documents only check enabled, min text len: %d", settings.MinMsgLen)
+		metaChecks = append(metaChecks, tgspam.DocumentsCheck(settings.MinMsgLen))
 	}
 	if settings.Meta.LinksLimit >= 0 {
 		log.Printf("[INFO] links check enabled, limit: %d", settings.Meta.LinksLimit)
@@ -946,7 +994,12 @@ func initLuaPlugins(detector *tgspam.Detector, settings *config.Settings) {
 	detector.LuaPlugins.DynamicReload = settings.LuaPlugins.DynamicReload
 
 	// create and initialize the plugin engine
-	luaEngine := plugin.NewChecker()
+	var engineOpts []plugin.Option
+	if settings.Transient.LuaUnrestricted {
+		log.Print("[WARN] lua plugins run with every Lua library, os and io included")
+		engineOpts = append(engineOpts, plugin.WithUnrestrictedLibs())
+	}
+	luaEngine := plugin.NewChecker(engineOpts...)
 	if err := detector.WithLuaEngine(luaEngine); err != nil {
 		log.Printf("[WARN] failed to initialize Lua plugins: %v", err)
 		return

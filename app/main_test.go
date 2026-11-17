@@ -2,20 +2,26 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	lgr "github.com/go-pkgz/lgr"
 	"github.com/go-pkgz/rest"
 	"github.com/jessevdk/go-flags"
 	"github.com/stretchr/testify/assert"
@@ -269,6 +275,41 @@ func Test_makeDetector(t *testing.T) {
 		assert.False(t, res.FirstMessageOnly)
 	})
 
+	t.Run("cas token is passed to the detector", func(t *testing.T) {
+		settings := makeTestSettings()
+		settings.CAS.API = "https://cas.example.com"
+		settings.CAS.Token = "cas-token"
+
+		res := makeDetector(settings)
+		assert.Equal(t, "https://cas.example.com", res.CasAPI)
+		assert.Equal(t, "cas-token", res.CasToken)
+	})
+
+	t.Run("cas warning depends on url and token", func(t *testing.T) {
+		tests := []struct {
+			name, api, token string
+			warn             bool
+		}{
+			{name: "url without token", api: "https://api.cas.chat", warn: true},
+			{name: "url with token", api: "https://api.cas.chat", token: "cas-token"},
+			{name: "no url", token: "cas-token"},
+			{name: "nothing set"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				buf := &bytes.Buffer{}
+				prev := log.Writer()
+				log.SetOutput(buf)
+				defer log.SetOutput(prev)
+
+				settings := makeTestSettings()
+				settings.CAS.API, settings.CAS.Token = tt.api, tt.token
+				makeDetector(settings)
+				assert.Equal(t, tt.warn, strings.Contains(buf.String(), "CAS check disabled"), buf.String())
+			})
+		}
+	})
+
 	t.Run("with max short msg count", func(t *testing.T) {
 		settings := makeTestSettings()
 		settings.MaxShortMsgCount = 3
@@ -348,6 +389,41 @@ func Test_makeDetector(t *testing.T) {
 		require.True(t, ok, "images check must run")
 		assert.True(t, img.Spam, "45-rune caption is below the 50 min-msg-len fallback, spam")
 	})
+
+	documentsResp := func(cr []spamcheck.Response) (spamcheck.Response, bool) {
+		for _, r := range cr {
+			if r.Name == "documents" {
+				return r, true
+			}
+		}
+		return spamcheck.Response{}, false
+	}
+
+	t.Run("document-only registers the check when enabled", func(t *testing.T) {
+		settings := makeTestSettings()
+		settings.Meta.DocumentsOnly = true
+		settings.MinMsgLen = 50
+
+		det := makeDetector(settings)
+		// 45-rune caption is below the 50 min-msg-len threshold, so it must be flagged; this
+		// pins that makeDetector wires DocumentsCheck to settings.MinMsgLen, not some other value
+		_, cr := det.Check(spamcheck.Request{
+			Msg: strings.Repeat("a", 45), UserID: "u1", Meta: spamcheck.MetaData{HasDocument: true},
+		})
+		doc, ok := documentsResp(cr)
+		require.True(t, ok, "documents check must run")
+		assert.True(t, doc.Spam, "45-rune caption is below the 50 min-msg-len threshold, spam")
+	})
+
+	t.Run("document-only does not register the check when disabled", func(t *testing.T) {
+		settings := makeTestSettings()
+		settings.Meta.DocumentsOnly = false
+
+		det := makeDetector(settings)
+		_, cr := det.Check(spamcheck.Request{Msg: "", UserID: "u1", Meta: spamcheck.MetaData{HasDocument: true}})
+		_, ok := documentsResp(cr)
+		assert.False(t, ok, "documents check must not run when disabled")
+	})
 }
 
 func Test_initLuaPlugins(t *testing.T) {
@@ -391,6 +467,33 @@ func Test_initLuaPlugins(t *testing.T) {
 		assert.Equal(t, "/path/to/plugins", detector.LuaPlugins.PluginsDir)
 		assert.Empty(t, detector.LuaPlugins.EnabledPlugins)
 		assert.False(t, detector.LuaPlugins.DynamicReload)
+	})
+
+	t.Run("unrestricted libraries only on request", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "env.lua"), []byte(`
+local home = os.getenv("HOME")
+function check(req)
+	return false, ""
+end
+`), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "plain.lua"), []byte(`
+function check(req)
+	return false, ""
+end
+`), 0o600))
+
+		settings := makeTestSettings()
+		settings.LuaPlugins.Enabled = true
+		settings.LuaPlugins.PluginsDir = dir
+		detector := makeDetector(makeTestSettings())
+		initLuaPlugins(detector, settings)
+		assert.Equal(t, []string{"plain"}, detector.GetLuaPluginNames())
+
+		settings.Transient.LuaUnrestricted = true
+		detector = makeDetector(makeTestSettings())
+		initLuaPlugins(detector, settings)
+		assert.Equal(t, []string{"env", "plain"}, detector.GetLuaPluginNames())
 	})
 }
 
@@ -1332,4 +1435,157 @@ func TestREADMEAllOptionsMatchesHelp(t *testing.T) {
 		assert.Contains(t, flagNames, token,
 			"README options block lists flag %s that is not defined in options struct", token)
 	}
+}
+
+func Test_makeDetectorJev(t *testing.T) {
+	jevSettings := func() *config.Settings {
+		s := makeTestSettings()
+		s.Jev.Token = "jev-token"
+		s.Jev.Question = "Is `message` spam?"
+		s.Jev.CriteriaSpam = "promotes"
+		s.Jev.CriteriaHam = "conversation"
+		s.Jev.Threshold = 0.3
+		s.Jev.Veto = true
+		s.Jev.HistorySize = 5
+		return s
+	}
+
+	t.Run("enabled by token", func(t *testing.T) {
+		res := makeDetector(jevSettings())
+		require.NotNil(t, res)
+		assert.True(t, res.JevVeto)
+		assert.Equal(t, 5, res.JevHistorySize)
+	})
+
+	t.Run("gibberish threshold reaches the jev request", func(t *testing.T) {
+		var body []byte
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"answers":{"spam":{"type":"noul","noul":0.1},"gibberish":{"type":"noul","noul":0.9}}}`))
+		}))
+		defer ts.Close()
+
+		s := jevSettings()
+		s.Jev.Veto = false // in veto mode a ham base verdict never reaches jev
+		s.Jev.HistorySize = 0
+		s.Jev.APIBase = ts.URL
+		s.Jev.GibberishThreshold = 0.5
+		require.NoError(t, s.Validate())
+		res := makeDetector(s)
+		require.NotNil(t, res)
+
+		spam, _ := res.Check(spamcheck.Request{Msg: "dsfg dfgh ewrt xczv dsfh", UserID: "123"})
+		assert.True(t, spam)
+		assert.Contains(t, string(body), `"gibberish":{"type":"noul"`, "the threshold must reach JevConfig")
+	})
+
+	t.Run("apibase alone leaves jev disabled", func(t *testing.T) {
+		s := makeTestSettings()
+		s.Jev.APIBase = "https://proxy.example/v1"
+		s.Jev.Question = "Is `message` spam?"
+		s.Jev.CriteriaSpam = "promotes"
+		s.Jev.CriteriaHam = "conversation"
+		s.Jev.Threshold = 0.3
+		require.False(t, s.IsJevEnabled(), "apibase must not enable jev on its own")
+
+		res := makeDetector(s)
+		require.NotNil(t, res)
+		assert.False(t, res.JevVeto)
+	})
+}
+
+// a bad jev config cannot reach makeDetector's log.Fatalf because Validate runs first at
+// startup (main.go:360); this pins that the two use the same predicate and the same contract
+func TestJevBadConfigRejectedBeforeStartup(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Settings)
+	}{
+		{"zero threshold", func(s *config.Settings) { s.Jev.Threshold = 0 }},
+		{"threshold above one", func(s *config.Settings) { s.Jev.Threshold = 2 }},
+		{"NaN threshold", func(s *config.Settings) { s.Jev.Threshold = math.NaN() }},
+		{"empty question", func(s *config.Settings) { s.Jev.Question = "" }},
+		{"empty spam criteria", func(s *config.Settings) { s.Jev.CriteriaSpam = "" }},
+		{"empty ham criteria", func(s *config.Settings) { s.Jev.CriteriaHam = "" }},
+		{"negative max symbols", func(s *config.Settings) { s.Jev.MaxSymbolsRequest = -1 }},
+		{"gibberish threshold above one", func(s *config.Settings) { s.Jev.GibberishThreshold = 1.5 }},
+		{"NaN gibberish threshold", func(s *config.Settings) { s.Jev.GibberishThreshold = math.NaN() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := makeTestSettings()
+			s.Jev.Token = "t"
+			s.Jev.Question = "Is `message` spam?"
+			s.Jev.CriteriaSpam = "promotes"
+			s.Jev.CriteriaHam = "conversation"
+			s.Jev.Threshold = 0.3
+			tt.mutate(s)
+			require.Error(t, s.Validate(), "startup validation must reject this before makeDetector runs")
+		})
+	}
+}
+
+func TestCollectMaskedSecrets(t *testing.T) {
+	t.Run("every provider token is masked", func(t *testing.T) {
+		s := makeTestSettings()
+		s.Telegram.Token = "tg-secret"
+		s.OpenAI.Token = "openai-secret"
+		s.Gemini.Token = "gemini-secret"
+		s.Jev.Token = "jev-secret"
+		s.CAS.Token = "cas-secret"
+		s.Server.AuthHash = "hash-secret"
+
+		masked := collectMaskedSecrets(s)
+		assert.Contains(t, masked, "cas-secret")
+		assert.Contains(t, masked, "tg-secret")
+		assert.Contains(t, masked, "openai-secret")
+		assert.Contains(t, masked, "gemini-secret")
+		assert.Contains(t, masked, "jev-secret")
+		assert.Contains(t, masked, "hash-secret")
+	})
+
+	t.Run("empty tokens are skipped", func(t *testing.T) {
+		s := makeTestSettings()
+		s.Jev.Token = "jev-secret"
+		masked := collectMaskedSecrets(s)
+		assert.Contains(t, masked, "jev-secret")
+		assert.NotContains(t, masked, "")
+	})
+
+	t.Run("auto web password is not masked because it is printed", func(t *testing.T) {
+		s := makeTestSettings()
+		s.Transient.WebAuthPasswd = "auto"
+		assert.NotContains(t, collectMaskedSecrets(s), "auto")
+
+		s.Transient.WebAuthPasswd = "chosen-password"
+		assert.Contains(t, collectMaskedSecrets(s), "chosen-password")
+	})
+}
+
+// pins the ordering regression: lgr replaces secrets sequentially, so an encrypt key that is a
+// prefix of the web password must be masked after it or the password's tail survives in the log
+func TestCollectMaskedSecrets_OverlappingSecretsFullyRedacted(t *testing.T) {
+	const (
+		encryptKey = "synthetic-overlap-master-key"
+		webPasswd  = encryptKey + "-K8r9"
+	)
+
+	s := makeTestSettings()
+	s.Transient.ConfigDBEncryptKey = encryptKey
+	s.Transient.WebAuthPasswd = webPasswd
+
+	secrets := collectMaskedSecrets(s)
+	keyIdx := slices.Index(secrets, encryptKey)
+	passIdx := slices.Index(secrets, webPasswd)
+	require.NotEqual(t, -1, keyIdx)
+	require.NotEqual(t, -1, passIdx)
+	assert.Less(t, passIdx, keyIdx, "the longer overlapping secret must be masked first")
+
+	// run it through the real logger, since the ordering only matters via lgr's sequential replace
+	buf := &bytes.Buffer{}
+	lg := lgr.New(lgr.Out(buf), lgr.Secret(secrets...))
+	lg.Logf("web=%s key=%s", webPasswd, encryptKey)
+
+	assert.NotContains(t, buf.String(), "K8r9", "the password tail must not survive redaction")
+	assert.NotContains(t, buf.String(), encryptKey)
 }

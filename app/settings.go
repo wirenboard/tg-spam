@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/umputun/tg-spam/app/config"
+	"github.com/umputun/tg-spam/app/storage/engine"
 )
 
 // optToSettings converts CLI options to the domain settings model
@@ -57,6 +59,7 @@ func optToSettings(opts options) *config.Settings {
 			LinksOnly:       opts.Meta.LinksOnly,
 			MentionOnly:     opts.Meta.MentionOnly,
 			VideosOnly:      opts.Meta.VideosOnly,
+			DocumentsOnly:   opts.Meta.DocumentsOnly,
 			AudiosOnly:      opts.Meta.AudiosOnly,
 			Forward:         opts.Meta.Forward,
 			Keyboard:        opts.Meta.Keyboard,
@@ -91,6 +94,21 @@ func optToSettings(opts options) *config.Settings {
 			RetryCount:         opts.Gemini.RetryCount,
 			HistorySize:        opts.Gemini.HistorySize,
 			CheckShortMessages: opts.Gemini.CheckShortMessages,
+		},
+
+		Jev: config.JevSettings{
+			APIBase:            opts.Jev.APIBase,
+			Veto:               opts.Jev.Veto,
+			Model:              opts.Jev.Model,
+			Question:           opts.Jev.Question,
+			CriteriaSpam:       opts.Jev.CriteriaSpam,
+			CriteriaHam:        opts.Jev.CriteriaHam,
+			Threshold:          opts.Jev.Threshold,
+			MaxSymbolsRequest:  opts.Jev.MaxSymbolsRequest,
+			RetryCount:         opts.Jev.RetryCount,
+			HistorySize:        opts.Jev.HistorySize,
+			CheckShortMessages: opts.Jev.CheckShortMessages,
+			GibberishThreshold: opts.Jev.GibberishThreshold,
 		},
 
 		LLM: config.LLMSettings{
@@ -152,7 +170,6 @@ func optToSettings(opts options) *config.Settings {
 			Spam:    opts.Message.Spam,
 			Dry:     opts.Message.Dry,
 			Warn:    opts.Message.Warn,
-			Restore: opts.Message.Restore,
 		},
 
 		Server: config.ServerSettings{
@@ -190,12 +207,15 @@ func optToSettings(opts options) *config.Settings {
 		TGDbg:              opts.TGDbg,
 		WebAuthPasswd:      opts.Server.AuthPasswd,
 		ConfigDBEncryptKey: opts.ConfigDBEncryptKey,
+		LuaUnrestricted:    opts.LuaPlugins.Unrestricted,
 	}
 
 	// set credentials in their respective domain structures
 	settings.Telegram.Token = opts.Telegram.Token
 	settings.OpenAI.Token = opts.OpenAI.Token
 	settings.Gemini.Token = opts.Gemini.Token
+	settings.Jev.Token = opts.Jev.Token
+	settings.CAS.Token = opts.CAS.Token
 	settings.Server.AuthHash = opts.Server.AuthHash
 
 	return settings
@@ -331,20 +351,37 @@ func setFieldFromDefaultTag(f reflect.Value, tag string) error {
 func applyCLIOverrides(settings *config.Settings, opts options, defaults *config.Settings) {
 	// override credentials if provided on CLI. This lets an operator rotate tokens
 	// without touching the DB — empty CLI value leaves the DB-stored token in place.
-	if opts.Telegram.Token != "" {
-		settings.Telegram.Token = opts.Telegram.Token
+	// a CLI-supplied credential is recorded in CredentialsFromCLI so dashboard saves
+	// never write it to the database and reloads keep it
+	markFromCLI := func(field string) {
+		if !slices.Contains(settings.Transient.CredentialsFromCLI, field) {
+			settings.Transient.CredentialsFromCLI = append(settings.Transient.CredentialsFromCLI, field)
+		}
 	}
-	if opts.OpenAI.Token != "" {
-		settings.OpenAI.Token = opts.OpenAI.Token
+	cliCredentials := []struct {
+		field string
+		value string
+		dst   *string
+	}{
+		{config.FieldTelegramToken, opts.Telegram.Token, &settings.Telegram.Token},
+		{config.FieldOpenAIToken, opts.OpenAI.Token, &settings.OpenAI.Token},
+		{config.FieldGeminiToken, opts.Gemini.Token, &settings.Gemini.Token},
+		{config.FieldJevToken, opts.Jev.Token, &settings.Jev.Token},
+		{config.FieldCASToken, opts.CAS.Token, &settings.CAS.Token},
 	}
-	if opts.Gemini.Token != "" {
-		settings.Gemini.Token = opts.Gemini.Token
+	for _, c := range cliCredentials {
+		if c.value == "" {
+			continue
+		}
+		*c.dst = c.value
+		markFromCLI(c.field)
 	}
 
 	// override auth password if explicitly provided (not using default "auto")
 	if opts.Server.AuthPasswd != "auto" {
 		settings.Transient.WebAuthPasswd = opts.Server.AuthPasswd
 		settings.Transient.AuthFromCLI = true
+		markFromCLI(config.FieldServerAuthHash)
 		// clear auth hash since we have a new password
 		settings.Server.AuthHash = ""
 	}
@@ -353,14 +390,17 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 	if opts.Server.AuthHash != "" {
 		settings.Server.AuthHash = opts.Server.AuthHash
 		settings.Transient.AuthFromCLI = true
+		markFromCLI(config.FieldServerAuthHash)
 		// clear password since hash takes precedence
 		settings.Transient.WebAuthPasswd = ""
 	}
 
 	// operational CLI overrides (dry-run, listen addr, file paths) live in a
 	// separate helper because they must also be reapplied after POST
-	// /config/reload — credentials/auth above intentionally are not reapplied
-	// (DB rotation wins on reload), so the split keeps reload semantics narrow.
+	// /config/reload — credentials/auth above are not reapplied: the reload
+	// handler keeps the in-memory values of fields listed in
+	// Transient.CredentialsFromCLI and takes the rest from the DB, so the split
+	// keeps reload semantics narrow.
 	applyOperationalCLIOverrides(settings, opts, defaults)
 }
 
@@ -372,7 +412,7 @@ func applyCLIOverrides(settings *config.Settings, opts options, defaults *config
 func applyOperationalCLIOverrides(settings *config.Settings, opts options, defaults *config.Settings) {
 	// override dry-run if explicitly enabled via CLI (default is false).
 	// false never overrides the DB value; to disable dry-run after enabling it,
-	// use the settings UI or save-config.
+	// use the settings UI; plain save-config would replace the whole stored config.
 	if opts.Dry {
 		settings.Dry = true
 	}
@@ -427,14 +467,14 @@ func applyAutoAuthFallback(settings *config.Settings) {
 	}
 }
 
-// loadConfigFromDB loads configuration from the database. Any field that was
-// absent in the persisted JSON blob (and therefore loaded as Go zero) is filled
-// from defaults, so legacy or partial blobs still yield a fully-populated
-// settings value. Fields whose zero is a meaningful operator choice
-// (zeroAwarePaths in the config package) are preserved regardless.
+// loadConfigFromDB loads configuration from the database. The blob is decoded
+// over the defaults, so a key absent from a legacy or partial blob takes its
+// default, zero-aware fields included, while a key stored as zero stays zero.
+// ApplyDefaults then refills zeros on fields whose zero is not a meaningful
+// operator choice (zeroAwarePaths in the config package).
 //
-// Passing a nil defaults template disables the fill step — used by a few tests
-// that care only about round-trip behavior.
+// Passing a nil defaults template skips the ApplyDefaults step — used by a few
+// tests that care only about round-trip behavior.
 func loadConfigFromDB(ctx context.Context, settings, defaults *config.Settings) error {
 	log.Print("[INFO] loading configuration from database")
 
@@ -449,20 +489,12 @@ func loadConfigFromDB(ctx context.Context, settings, defaults *config.Settings) 
 		}
 	}()
 
-	// create settings store with encryption if key provided
-	var storeOpts []config.StoreOption
-	if settings.Transient.ConfigDBEncryptKey != "" {
-		crypter, cryptErr := config.NewCrypter(settings.Transient.ConfigDBEncryptKey, settings.InstanceID)
-		if cryptErr != nil {
-			return fmt.Errorf("invalid encryption key: %w", cryptErr)
-		}
-		storeOpts = append(storeOpts, config.WithCrypter(crypter))
-		log.Print("[INFO] configuration encryption enabled for database access")
-	}
-
-	settingsStore, err := config.NewStore(ctx, db, storeOpts...)
+	settingsStore, err := makeSettingsStore(ctx, db, settings)
 	if err != nil {
-		return fmt.Errorf("failed to create settings store: %w", err)
+		return err
+	}
+	if settings.Transient.ConfigDBEncryptKey != "" {
+		log.Print("[INFO] configuration encryption enabled for database access")
 	}
 
 	// load settings
@@ -505,11 +537,34 @@ func loadConfigFromDB(ctx context.Context, settings, defaults *config.Settings) 
 			settings.InstanceID, instanceID)
 	}
 
-	// fill any field left zero by a partial/legacy blob from the CLI-default template
+	// refill stored zeros from the CLI-default template, except where zero is a meaningful choice
 	settings.ApplyDefaults(defaults)
 
 	log.Printf("[INFO] configuration loaded from database successfully")
 	return nil
+}
+
+// makeSettingsStore opens the --confdb settings store on db, encrypted when a key is set. Every
+// load decodes the stored blob over the CLI defaults, so a key missing from the blob takes its
+// default rather than zero. Startup and POST /config/reload both load through a store made here.
+func makeSettingsStore(ctx context.Context, db *engine.SQL, settings *config.Settings) (*config.Store, error) {
+	defaults, err := defaultSettingsTemplate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build defaults template for settings store: %w", err)
+	}
+	storeOpts := []config.StoreOption{config.WithDefaults(defaults)}
+	if settings.Transient.ConfigDBEncryptKey != "" {
+		crypter, cryptErr := config.NewCrypter(settings.Transient.ConfigDBEncryptKey, settings.InstanceID)
+		if cryptErr != nil {
+			return nil, fmt.Errorf("invalid encryption key for settings store: %w", cryptErr)
+		}
+		storeOpts = append(storeOpts, config.WithCrypter(crypter))
+	}
+	store, err := config.NewStore(ctx, db, storeOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create settings store: %w", err)
+	}
+	return store, nil
 }
 
 // saveConfigToDB saves the current configuration to the database
@@ -555,8 +610,11 @@ func saveConfigToDB(ctx context.Context, settings *config.Settings) error {
 		settings.Server.AuthHash = hash
 	}
 
-	// save settings to database
-	if err := settingsStore.Save(ctx, settings); err != nil {
+	// save-config is the explicit way to store command-line credentials, so the
+	// protection Store.Save applies to CLI-supplied credentials is lifted here
+	toSave := *settings
+	toSave.Transient.CredentialsFromCLI = nil
+	if err := settingsStore.Save(ctx, &toSave); err != nil {
 		return fmt.Errorf("failed to save configuration to database: %w", err)
 	}
 

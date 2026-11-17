@@ -85,8 +85,9 @@ type Config struct {
 	// reapplication that startup performs (ApplyDefaults + path/listen/dry
 	// CLI overrides) so a partial/legacy DB blob and operator-supplied
 	// --files.dynamic / --files.samples / --server.listen / --dry survive
-	// POST /config/reload. Credentials (Telegram/OpenAI/Gemini tokens) are
-	// intentionally NOT reapplied here — DB rotation wins on reload.
+	// POST /config/reload. Credentials are not reapplied here: the reload
+	// handler keeps the in-memory values of fields listed in
+	// Transient.CredentialsFromCLI and takes the rest from the DB.
 	ReloadNormalize func(*config.Settings)
 }
 
@@ -615,6 +616,8 @@ func (s *Server) getSettingsHandler(w http.ResponseWriter, _ *http.Request) {
 	safe.Telegram.Token = ""
 	safe.OpenAI.Token = ""
 	safe.Gemini.Token = ""
+	safe.Jev.Token = ""
+	safe.CAS.Token = ""
 	safe.Server.AuthHash = ""
 
 	resp := struct {
@@ -865,6 +868,19 @@ func (s *Server) htmlDetectedSpamHandler(w http.ResponseWriter, r *http.Request)
 				filteredDS = append(filteredDS, entry)
 			}
 		}
+	case "jev":
+		for _, entry := range ds {
+			hasJev := false
+			for _, check := range entry.Checks {
+				if check.Name == "jev" {
+					hasJev = true
+					break
+				}
+			}
+			if hasJev {
+				filteredDS = append(filteredDS, entry)
+			}
+		}
 	default: // "all" or any other value
 		filteredDS = ds
 	}
@@ -872,6 +888,7 @@ func (s *Server) htmlDetectedSpamHandler(w http.ResponseWriter, r *http.Request)
 	s.appSettingsMu.RLock()
 	openAIEnabled := s.AppSettings != nil && s.AppSettings.IsOpenAIEnabled()
 	geminiEnabled := s.AppSettings != nil && s.AppSettings.Gemini.Token != ""
+	jevEnabled := s.AppSettings != nil && s.AppSettings.IsJevEnabled()
 	s.appSettingsMu.RUnlock()
 
 	tmplData := struct {
@@ -881,6 +898,7 @@ func (s *Server) htmlDetectedSpamHandler(w http.ResponseWriter, r *http.Request)
 		Filter              string
 		OpenAIEnabled       bool
 		GeminiEnabled       bool
+		JevEnabled          bool
 	}{
 		DetectedSpamEntries: filteredDS,
 		TotalDetectedSpam:   len(ds),
@@ -888,6 +906,7 @@ func (s *Server) htmlDetectedSpamHandler(w http.ResponseWriter, r *http.Request)
 		Filter:              filter,
 		OpenAIEnabled:       openAIEnabled,
 		GeminiEnabled:       geminiEnabled,
+		JevEnabled:          jevEnabled,
 	}
 
 	// if it's an HTMX request, render both content and count display for OOB swap
@@ -1009,6 +1028,7 @@ func (s *Server) htmlSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	s.appSettingsMu.RUnlock()
 
 	geminiEnabled := settingsSnapshot != nil && settingsSnapshot.Gemini.Token != ""
+	jevEnabled := settingsSnapshot != nil && settingsSnapshot.IsJevEnabled()
 
 	data := struct {
 		*config.Settings
@@ -1031,6 +1051,7 @@ func (s *Server) htmlSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		ConfigDBMode    bool
 		BotUsername     string
 		GeminiEnabled   bool
+		JevEnabled      bool
 	}{
 		Settings:            settingsSnapshot,
 		LuaAvailablePlugins: luaPlugins,
@@ -1061,6 +1082,7 @@ func (s *Server) htmlSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		ConfigDBMode:    s.ConfigDBMode,
 		BotUsername:     s.BotUsername,
 		GeminiEnabled:   geminiEnabled,
+		JevEnabled:      jevEnabled,
 	}
 
 	if err := tmpl.ExecuteTemplate(w, "settings.html", data); err != nil {

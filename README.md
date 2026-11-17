@@ -58,7 +58,6 @@ There are some important customizations available:
   - `--message.startup=, [$MESSAGE_STARTUP]` - message sent to the group when bot is started, can be empty
   - `--message.spam=, [$MESSAGE_SPAM]` - message sent to the group when spam detected, optional
   - `--message.dry=, [$MESSAGE_DRY]` - message sent to the group when spam detected in dry mode
-  - `--message.restore=, [$MESSAGE_RESTORE]` - message sent to the group when original message is restored by admin, can be empty
 
 By default, the bot reports back to the group with the message `this is spam` and `this is spam (dry mode)` for dry mode. In non-dry mode, the bot will delete the spam message and ban the user permanently. It is possible to suppress those reports with `--no-spam-reply, [$NO_SPAM_REPLY]` parameter.
 
@@ -78,6 +77,8 @@ The analysis is active only if both ham and spam samples are present in the data
 
 When a message contains quoted or reply-to content (e.g., from external channels), that text is concatenated with the main message and included in the analysis.
 
+Text that Telegram delivers outside the message body is checked as part of the message too: an image or file caption, an article (rich message), a checklist (its title and tasks), and a poll (its question, description, options and quiz explanation). A checklist or poll with no message text is checked on that content alone.
+
 **Spam message similarity check**
 
 This check uses the provided samples and is active by default. The bot compares the message with the samples and if the similarity is greater than `--similarity-threshold=, [$SIMILARITY_THRESHOLD]` (default is 0.5), the message is marked as spam. Setting the similarity threshold to 1 will effectively disable this check.
@@ -95,7 +96,15 @@ Both matching modes are case-insensitive and normalize multiple spaces to single
 
 **Combot Anti-Spam System (CAS) integration**
 
-Nothing needed to enable CAS integration, it is enabled by default. To disable it, set `--cas.api=, [$CAS_API]` to empty string.
+CAS requires an API token for every request. Set `--cas.token=, [$CAS_TOKEN]` to enable the CAS check; without it the check is skipped and the bot logs a warning at startup. To disable CAS entirely, set `--cas.api=, [$CAS_API]` to empty string.
+
+CAS uses the Combot API key, which belongs to a Telegram account (see [CAS API](https://cas.chat/api)):
+
+1. Sign in to [combot.org](https://combot.org) with Telegram.
+2. Open Settings and find the API key block.
+3. If it says "No API key generated", press "Reset API key" to create one, then copy the key.
+
+The token is a credential: it is masked in logs, never shown in the web UI, and stored encrypted in the database when `--confdb-encrypt-key` is set. It is not editable in the web UI, and a new token takes effect after a restart.
 
 The default user agent is sometimes blocked by CDNs like CloudFlare. To use a custom User-Agent when querying CAS API, set `--cas.user-agent=, [$CAS_USER_AGENT]` to the desired value.
 
@@ -110,9 +119,9 @@ To keep the number of calls low and the price manageable, the bot uses the follo
 -  The OpenAI check is the final step in the series of checks. By default (if `--openai.veto` is not configured), the bot will not invoke OpenAI if any preceding checks have classified the message as spam. This default setting enhances spam detection, allowing for the identification of more spam messages that might otherwise go unnoticed.
 -  Configuring `--openai.veto` alters the workflow. In veto mode, OpenAI is contacted *only* if the message is deemed spam by other checks. A message is classified as spam solely if OpenAI corroborates this determination. This approach minimizes the occurrence of false positives, resulting in a more meticulous spam detection process.
 -  Optionally, the OpenAI check can evaluate the message within the context of previous messages. This is beneficial for identifying spam patterns that may not be evident in the message itself or for avoiding false positives when the context provides additional insights, indicating that the message is not an isolated spam but rather a legitimate part of an ongoing conversation. To activate this feature, set `--openai.history-size=, [$OPENAI_HISTORY_SIZE]` to a positive integer, specifying the number of preceding messages to include. A range of 5-10 should suffice for most scenarios. By default, this feature is disabled.
--  For models that support "thinking mode" (like Gemini 2.5 Flash), you can control the model's reasoning behavior by setting `--openai.reasoning-effort=` to one of the following values: `none` (disables thinking, default), `low`, `medium`, or `high`. This parameter is particularly useful for controlling how much effort the model puts into its reasoning process. For most spam detection cases, setting this to `none` is recommended for faster responses. TG-Spam also automatically strips all `<thought></thought>` tags from responses, ensuring clean output regardless of the model's reasoning behavior.
+-  For models that support "thinking mode" (like Gemini 2.5 Flash), you can control the model's reasoning behavior by setting `--openai.reasoning-effort=` to one of the following values: `none` (default, the parameter is not sent and the model uses its own default effort), `off` (sends `reasoning_effort: none` to disable thinking), `low`, `medium`, or `high`. `none` is safe for any model, including ones without reasoning support such as `gpt-4o-mini`, which reject the parameter; `off` works only with models that accept `none`, such as `gpt-6-luna`, while others such as `gpt-6.1-sol` reject it. For most spam detection cases on a thinking model that accepts it, `off` is recommended for faster responses. With `--confdb`, this value comes from the database; to change it, run `save-config` without `--confdb` (or `CONFDB`), supplying the full intended configuration, since this replaces the stored settings. TG-Spam also automatically strips all `<thought></thought>` tags from responses, ensuring clean output regardless of the model's reasoning behavior.
 - You can specify additional custom prompts to better detect certain spam patterns by using the `--openai.custom-prompt=[$OPENAI_CUSTOM_PROMPT]` parameter. This parameter can be repeated multiple times to add different spam patterns to check for. For example, to detect messages following the pattern "will perform <action> - $1,234", you can add `--openai.custom-prompt="Check if message follows pattern: 'will perform [action] - $[amount]' which is a common spam format"`. Custom prompts are appended to the base system prompt and help guide the AI in identifying specific spam patterns that might be difficult to detect with other methods.
--  Messages shorter than `--min-msg-len` are typically skipped by most checks because short messages often lack sufficient context to accurately determine if they are spam. However, you can enable OpenAI checks for short messages by setting `--openai.check-short-messages`. This can be useful when dealing with concise spam patterns that OpenAI might be able to detect through its more sophisticated analysis, even with limited text. When this feature is enabled, short messages are always checked by OpenAI regardless of the `--openai.veto` setting, since there are no other spam detection results to veto (most checks are skipped for short messages). **Note**: Enabling this feature may increase API costs, especially in high-volume environments with many short messages.
+-  Messages shorter than `--min-msg-len` are typically skipped by most content checks because they often lack enough context to classify accurately. Enable LLM checks for short messages with `--openai.check-short-messages` or `--gemini.check-short-messages`. A short message reaches an enabled LLM only when no earlier check has flagged it; stop-word, metadata, Lua, and CAS checks run before the length gate. Veto settings do not affect short-message checks: an earlier spam verdict returns before any LLM runs, while an unflagged short message has no verdict to veto. **Note**: Enabling short-message LLM checks may increase API costs, especially in high-volume environments.
 
 
 **Gemini integration**
@@ -127,14 +136,26 @@ Setting `--gemini.token [$GEMINI_TOKEN]` enables Google Gemini integration. Gemi
 - Short message checking can be enabled with `--gemini.check-short-messages`.
 - The default model is `gemma-4-31b-it`. You can change it with `--gemini.model=[$GEMINI_MODEL]`.
 
+**Jev integration**
+
+Setting `--jev.token [$JEV_TOKEN]` enables [jev](https://docs.typesafe.ai), a decision model rather than a text generator. Where OpenAI and Gemini are asked to write a JSON verdict, jev is asked a typed question and returns a bare probability, which TG-Spam thresholds itself. It can be used alongside or instead of the other providers and participates in `--llm.consensus` the same way.
+
+- By default the jev integration is disabled. To enable it, set `--jev.token` to a valid typesafe.ai API key. Setting `--jev.apibase` alone does NOT enable it, so pointing at a proxy without a credential cannot turn the provider on by accident.
+- One spam question is asked, plus the optional gibberish question below. `--jev.question` carries the spam question and `--jev.criteria-spam` / `--jev.criteria-ham` describe the two sides. All three ship with the text the threshold below was measured against; changing any of them invalidates that measurement.
+- `--jev.threshold` defaults to `0.30`. Start there. If legitimate messages are flagged, raise it, for example to `0.35`; if spam is missed, try lowering it toward `0.25`. A higher threshold flags fewer messages, which can also let more spam through; a lower one catches more potential spam but can flag more legitimate messages. Review the results in your chat after adjusting it. The default was chosen from a small replay of one chat rather than a separate validation set, and that replay preserved the newline between a post and its quote where production `cleanText` removes it, so its counts do not establish production error rates for this default.
+- `--jev.model` pins a version such as `jev-1.13.0` and should never be an alias: an alias moves and silently changes what a tuned threshold means. The model the API actually resolved is logged at debug level on every check.
+- `--jev.veto`, `--jev.history-size` and `--jev.check-short-messages` behave exactly as their OpenAI and Gemini counterparts.
+- `--jev.gibberish-threshold` (off by default, `0`) adds a second question to the same jev call: is the message random letter groups that are not words in any language, like `dsfg dfgh ewrt xczv dsfh`. A gibberish probability at or above the threshold marks the message as spam, whatever the spam question says; below it, the spam question decides as usual. `0.50` is a reasonable start: replayed on 1,061 distinct inputs rebuilt from six days of one chat's messages (15+ characters, deduplicated), it flagged only the one gibberish post; in a separate set of hand-written test messages, slang, laughter, repeated letters, code and text typed in the wrong keyboard layout all stayed below it. Gibberish made of Cyrillic letters (`фыва олдж`) scores lower and is mostly missed at `0.50`. The question wording is fixed, since the threshold was measured against it. It requires `--jev.history-size=0`, because history is sent as part of the judged message. The question is not asked for messages with quoted or replied-to text, because that text is sent together with the message and would be judged as the sender's own; a gibberish post that quotes or replies to a text message is therefore not caught by the gibberish question. A reply to a message without text, such as a photo or a sticker, remains eligible for gibberish judging. Like every jev check it only sees messages at least `--min-msg-len` long (default 50; the example above is 24) unless `--jev.check-short-messages` is set. In veto mode jev runs only on messages other checks already flagged, except short messages with `--jev.check-short-messages`, so without that flag the gibberish question cannot catch a first message in veto mode.
+- `--jev.retry-count` is total attempts, not retries after the first, and every error is retried regardless of its HTTP status. That is the behavior shared with the other providers, not something specific to jev.
+
 **LLM consensus**
 
 When multiple LLM providers are eligible for the same message, TG-Spam resolves their results with `--llm.consensus=[$LLM_CONSENSUS]`:
 
 - `any` is the default. If any eligible LLM disagrees with the base decision, the base decision flips.
 - `all` requires all eligible LLMs to agree before the base decision flips.
-- Eligibility still depends on each provider's own settings, such as `--openai.veto`, `--gemini.veto`, and the short-message flags.
-- Each LLM request is subject to `--llm.request-timeout` (default 30s). If a provider does not respond in time, the request is cancelled and the base decision is kept.
+- Eligibility still depends on each provider's own settings, such as `--openai.veto`, `--gemini.veto`, `--jev.veto`, and the short-message flags.
+- Each LLM request is subject to `--llm.request-timeout` (default 30s). If a provider does not respond in time, the request is cancelled and that provider contributes no flip. Under `any` another provider can still flip the base decision; under `all` the missing flip prevents one.
 
 
 **Emoji Count**
@@ -143,7 +164,7 @@ If the number of emojis in the message is greater than `--max-emoji=, [$MAX_EMOJ
 
 **Minimum message length**
 
-This is not a separate check, but rather a parameter to control the minimum message length. If the message length is less than `--min-msg-len=, [$MIN_MSG_LEN]` (default is 50), the message won't be checked for spam. Setting the min message length to 0 will effectively disable this check. This check is needed to avoid false positives on short messages.
+This is not a separate check, but rather a parameter to control the minimum message length. If the message length is less than `--min-msg-len=, [$MIN_MSG_LEN]` (default is 50), the message won't be checked for spam. Setting the min message length to 0 will effectively disable this check. When `--max-short-msg-count` is set, `--min-msg-len` must be 2 or more (see Short message flood detection). This check is needed to avoid false positives on short messages.
 
 **Note**: Messages shorter than `--min-msg-len` will not count towards user approval when `--first-messages-count` is configured. This prevents users from becoming approved by sending multiple short messages (like "hi", "ok", "yes") that bypass meaningful spam detection. Only messages that meet the minimum length requirement will increment the user's message count for approval purposes.
 
@@ -172,6 +193,12 @@ By default the image caption threshold equals `--min-msg-len`. Use `--meta.image
 **Video only check**
 
 This option is disabled by default. If `--meta.video-only` set or `env:META_VIDEO_ONLY` is `true`, the bot will check the message for the presence of any video or video notes. If the message contains videos with text shorter than `--min-msg-len` (default: 50 characters), it will be marked as spam.
+
+**Document only check**
+
+This option is disabled by default. If `--meta.document-only` set or `env:META_DOCUMENT_ONLY` is `true`, the bot will check the message for the presence of any document (file attachment). If the message contains a document with text shorter than `--min-msg-len` (default: 50 characters), it will be marked as spam. A forwarded document is checked the same way, since Telegram delivers the original caption as message text. Note: Telegram also sets the document field for GIFs, so a GIF without a long enough caption is flagged too. Only text the sender wrote counts toward the threshold: quoted and reply-to text is excluded, so replying to a long message does not exempt a caption-less file.
+
+Enabling this check also changes what reaches the rest of the pipeline. A file or GIF posted without a caption used to be dropped on intake; with the check on it is passed through, so it is stored in the message locator and counts toward `--max-short-msg-count` if that is configured. Checks that do not need message text also run against it: stopword matching (which also matches the username and user ID), the username-symbols check, Lua plugins, and CAS. None of them is enabled on a stock installation; each requires configuration, CAS a `--cas.token`. Any of these checks can produce a spam verdict and, in normal mode, a permanent ban. For a caption-less file shorter than `--min-msg-len`, the document check flags it and the detector returns before the LLM path. Neither OpenAI nor Gemini runs, and their veto settings cannot override the verdict, regardless of either provider's `check-short-messages` setting. With the check off, a directly posted caption-less file is still dropped on intake, exactly as before. A forwarded one, or one attached to a reply to a message from another chat, is admitted on its own regardless of this option. That behavior predates this option, which neither adds nor removes it.
 
 **Audio only check**
 
@@ -223,6 +250,8 @@ This option is disabled by default. When enabled, the bot tracks messages from e
 
 **Important**: Duplicate detection is a behavioral check that runs for **all users**, including approved users. This differs from content-based checks (similarity, classifier, OpenAI, Gemini) which are skipped for approved users for performance reasons. The rationale is that approved users can still exhibit spam behavior by sending duplicate messages, and this pattern should be detected regardless of trust status.
 
+Messages with no text of their own are not counted: media without a caption, including media posted as a reply or with a quote. In a photo album with a caption on only one photo, that caption counts once, and an album without captions is not counted at all. An album with the same caption on every photo counts each photo.
+
 Configure with:
 - `--duplicates.threshold=, [$DUPLICATES_THRESHOLD]` (default: 0, disabled) - Number of identical messages to trigger spam detection
 - `--duplicates.window=, [$DUPLICATES_WINDOW]` (default: 1h) - Time window for tracking duplicate messages
@@ -231,9 +260,9 @@ Configure with:
 
 This option is disabled by default. When enabled, the bot bans an unapproved user who has accumulated too many short messages without graduating to "approved" status. This catches spammers who probe a channel with innocuous one-word messages ("hi", "hello", "yo") that individually evade content-based checks and the duplicate detector.
 
-Media-only messages (a photo or video with no caption) count as short messages too, since image flooding is the same probing pattern without text. An unapproved user posting several caption-less photos will reach the threshold.
+Media-only messages (a photo or video with no caption) count as short messages too, since image flooding is the same probing pattern without text. An unapproved user posting several caption-less photos will reach the threshold. A caption-less file or GIF posted directly counts only when `--meta.document-only` is enabled; without it, it is dropped before the counter sees it. A forwarded one, or one attached to a reply to a message from another chat, is admitted regardless of that option and counts either way.
 
-**Important**: this check requires the first-message evaluation path (`--first-messages-count > 0` or `--first-message-only`); `--paranoid` mode is incompatible and rejected at startup. The risk window for naturally terse legitimate users is bounded to the evaluation period; once approved, the check skips for the rest of that user's lifetime.
+**Important**: this check requires the first-message evaluation path (`--first-messages-count > 0` or `--first-message-only`); `--paranoid` mode is incompatible and rejected at startup. When it is enabled, the configuration also requires `--min-msg-len` of 2 or more, so that non-empty text can count as short; 0 and 1 are rejected at startup, which also rejects the media-only counting that 1 allowed. With `--confdb`, CLI flags do not override these two settings: if short-message flood detection is enabled with a stored `min_msg_len` of 1, change and save it through the web settings before upgrading, or startup will fail. A stored 0 is replaced by the default of 50 on load. The risk window for naturally terse legitimate users is bounded to the evaluation period; once approved, the check skips for the rest of that user's lifetime.
 
 Configure with:
 - `--max-short-msg-count=, [$MAX_SHORT_MSG_COUNT]` (default: 0, disabled) - Ban after N short messages from an unapproved user
@@ -246,7 +275,7 @@ This option is disabled by default. When enabled, the bot tracks emoji reactions
 
 Only applies to unapproved users — approved users are exempt from reaction spam detection.
 
-Reaction bans are reported to the admin chat with the same `change ban` and `info` buttons as message-based bans, so a wrongly banned reaction spammer can be unbanned and approved straight from the notification (`change ban` opens an unban/keep-banned confirmation).
+Reaction bans are reported to the admin chat with the same `change ban` and `info` buttons as message-based bans, so a wrongly banned reaction spammer can be unbanned and approved straight from the notification (`change ban` opens an unban/keep-banned confirmation). In soft-ban mode the notification starts with `restricted` instead of `permanently banned`, because the user is restricted, not banned.
 
 Note: the bot always subscribes to `message_reaction` updates from Telegram on startup, regardless of whether `--reactions.max-reactions` is set. This is a change from previous versions where no reaction updates were requested.
 
@@ -288,7 +317,7 @@ export CONFDB_ENCRYPT_KEY="your-secure-master-key-at-least-20-chars"
 ./tg-spam --confdb --telegram.group=your-group
 ```
 
-On subsequent `--confdb` starts the bot loads every persisted group from the database; transient flags (paths, server listen address, debug flags) still come from the CLI. See [db-conf.md](db-conf.md) for the full persisted settings inventory and the CLI/DB precedence rules. Note that not every persisted field has a form input on the `/settings` page — connection settings, message templates, OpenAI/Gemini prompt and tuning, abnormal-spacing thresholds, and several others require a CLI restart or `save-config` round-trip to change. The "Settings UI vs CLI-only Fields" section in db-conf.md lists the full inventory.
+On subsequent `--confdb` starts the bot loads every persisted group from the database; transient flags (paths, server listen address, debug flags) still come from the CLI. Credentials passed on the command line or through the environment (`--telegram.token`, `--openai.token`, `--gemini.token`, `--jev.token`, `--server.auth`, `--server.auth-hash`) override the database for the running process only: saving settings from the web UI never writes them to the database, and a reload keeps them. To store one in an existing config, run `save-config --confdb` with the same `--db`, `--instance-id` and `--confdb-encrypt-key`; plain `save-config` builds the whole config from CLI flags and replaces everything set in the web UI, so use it only to seed a fresh database. See [db-conf.md](db-conf.md) for the full persisted settings inventory and the CLI/DB precedence rules. Note that not every persisted field has a form input on the `/settings` page — connection settings, message templates, OpenAI/Gemini prompt and tuning, abnormal-spacing thresholds, and several others require a CLI restart or `save-config` round-trip to change. The "Settings UI vs CLI-only Fields" section in db-conf.md lists the full inventory.
 
 #### Security Details
 
@@ -378,7 +407,7 @@ To allow such a feature, `--admin.group=,  [$ADMIN_GROUP]` must be specified. Th
 
 **linked channel admin rights**
 
-If the monitored group is a discussion group linked to a Telegram channel, the linked channel automatically receives admin-like rights. When the channel owner sends commands "as the channel" in the discussion group, the bot recognises the channel identity and grants it the same privileges as a superuser. This means the linked channel can use `/ban`, `/spam`, and `/warn` commands without being explicitly listed in `--super=`. The linked channel is resolved at startup via the Telegram Bot API `getChat` method, and no additional configuration is required. Regular messages posted by the linked channel also skip spam checking, similar to anonymous admin posts from the group itself.
+If the monitored group is a discussion group linked to a Telegram channel, the linked channel automatically receives admin-like rights. When the channel owner sends commands "as the channel" in the discussion group, the bot recognises the channel identity and grants it the same privileges as a superuser. This means the linked channel can use `/ban`, `/spam`, and `/warn` commands without being explicitly listed in `--super=`. The linked channel is resolved at startup via the Telegram Bot API `getChat` method, and no additional configuration is required. Regular messages posted by the linked channel also skip spam checking, similar to anonymous admin posts from the group itself. The bot never bans the linked channel or the group itself: `/spam`, `/ban` or `/warn` in reply to their posts, or a forward of such a post to the admin chat, deletes the post without a ban, and user reports of such posts are rejected.
 
 **aggressive cleanup**
 
@@ -414,13 +443,19 @@ To enable user spam reporting, set `--report.enabled` to `true` and configure an
    - **Reject**: Reject this report without taking action
    - **Ban Reporters**: Open a dialog to select and ban a specific reporter who may be abusing the reporting system (requires confirmation)
 
+With `--dry` or `--training`, **Approve Ban** neither bans the user nor deletes the message; the report is resolved and the notification reads "would have been banned (dry)" or "would have been banned (training)". If Telegram rejects the ban, nothing is deleted, the report and its buttons stay, and the notification gets a "ban failed: <reason>" line, so the admin can press **Approve Ban** again.
+
 Only superusers configured by username can be included as Telegram `@username` mentions. Numeric IDs do not provide a username.
+
+Users can report posts made on behalf of a channel. The report identifies the channel, and an approved report or the auto-ban threshold bans it from posting in the group. Channels are banned even in soft-ban mode, since Telegram cannot restrict channel senders. Posts made as the group itself or its linked channel can't be reported by users; admins handle them with `/spam`.
+
+Reports are accepted only in the monitored group. A report command sent in any other chat the bot is a member of, testing chats included, is ignored.
 
 #### Advanced Reporting Features
 
 - **Approved Users Only**: Only users who have been automatically approved can submit reports. This is always enabled to prevent malicious actors from abusing the report system. Users are automatically approved after successfully sending a few non-spam messages (the threshold is configured via `--first-messages-count`, which defaults to 1 if `--first-messages` is enabled).
 
-- **Auto-Ban Threshold**: Automatically ban reported users when a higher threshold is reached using `--report.auto-ban-threshold=`. When configured, the bot will automatically delete the message and ban the user once this many reports are received, without requiring admin approval. This threshold must be greater than or equal to the manual approval threshold (`--report.threshold`) or set to 0 to disable. The bot respects soft-ban mode when configured.
+- **Auto-Ban Threshold**: Automatically ban reported users when a higher threshold is reached using `--report.auto-ban-threshold=`. When configured, the bot will automatically delete the message and ban the user once this many reports are received, without requiring admin approval. This threshold must be greater than or equal to the manual approval threshold (`--report.threshold`) or set to 0 to disable. The bot respects soft-ban mode when configured. With `--dry` or `--training` the auto-ban neither bans nor deletes, and the admin notification says the user would have been banned. The bot attempts to delete the message before the auto-ban, so a rejected ban does not undo a successful deletion; the notification then says the user was not banned and gives the reason.
 
   Example: `--report.threshold=2 --report.auto-ban-threshold=5` will notify admins after 2 reports but automatically ban after 5 reports.
 
@@ -460,21 +495,60 @@ To enable Lua plugins:
 4. Optionally, specify which plugins to enable with `--lua-plugins.enabled-plugins=plugin1,plugin2`
 5. Optionally, enable dynamic reloading with `--lua-plugins.dynamic-reload` to automatically reload plugins when they change
 
-Each Lua plugin must define a `check` function that takes a request object and returns a boolean (is it spam) and a string (details):
+Each Lua plugin must define a `check` function that takes a request object and returns a boolean (is it spam), a string (details), and an optional third boolean (approve this message):
 
 ```lua
+local approved_user_ids = {
+    -- Add Telegram user IDs that may approve the current message:
+    -- ["123456789"] = true,
+}
+
 function check(request)
     -- request contains: msg, user_id, user_name, first_name, last_name, is_premium, meta
-    -- meta contains: images, links, mentions, has_video, has_audio, has_forward, has_keyboard, has_giveaway, has_contact, has_external_reply, message_id
-    
-    -- Your custom spam detection logic here
+    -- meta contains: images, links, mentions, has_video, has_audio, has_forward, has_keyboard, has_giveaway, has_contact, has_document, has_external_reply, message_id
+
     if string.match(request.msg, "some pattern") then
         return true, "matched suspicious pattern"
     end
-    
-    return false, "message looks clean"
+
+    local approve = approved_user_ids[request.user_id] == true
+    return false, "message looks clean", approve
 end
 ```
+
+The third return is backward compatible. Missing, `nil`, and boolean `false` mean no approval. Only an exact boolean `true` is accepted. Other types are ignored and logged once per plugin and type. A plugin error never approves a message, and `true` cannot approve a result where the same plugin returned spam.
+
+Approval clears soft spam results from the current `Detector.Check` call. When at least one plugin approves and a soft check reports spam, the detector returns ham, skips LLM checks, and adds one `lua-approve` row naming the approving plugins. Soft checks include duplicate detection, stop words, emoji, meta checks, Lua checks, CAS, multi-language text, abnormal spacing, similarity, and the classifier. Short-message-flood and prohibited-language checks return before Lua plugins run and cannot be cleared this way.
+
+A cleared short message follows the existing short-message rule: it does not enter ham history or count toward user graduation. A cleared normal-length message follows the ordinary ham path and enters the bounded ham history. It also counts toward configured user graduation unless the request is check-only. With the default `--first-messages-count=1`, one cleared normal-length message graduates the sender, so later messages skip content analysis under the existing graduation rules. When LLM history is enabled, that message can be included as context in later LLM checks, including checks for other users.
+
+**Checking new members on join.** A plugin can also define an optional `check_join` function. It runs when a member joins the monitored group, before the member posts anything, so it can act on accounts whose only payload is the display name:
+
+```lua
+function check_join(request)
+    -- request contains: user_id, user_name, first_name, last_name, is_premium (no msg, no meta)
+    local name = to_lower(request.first_name .. " " .. request.last_name)
+    if contains_any(name, {"shop", "24/7"}) then
+        return true, "suspicious display name"
+    end
+    return false, "name looks clean"
+end
+```
+
+- `check_join` returns the same values as `check`: is spam and details. A third return value is ignored, because there is no message to approve on join.
+- Only `check_join` decides on a join. `check` and the other spam checks do not run. A plugin without `check_join` takes no part, and a missing function, a `check_join` that is not a function, or a Lua error never bans.
+- The same plugins are used as for `check`: those in `--lua-plugins.enabled-plugins`, or all loaded plugins when the list is empty. Each plugin's own `check_join` is called.
+- All plugins share one Lua state, so `check_join` is a global name that the next loaded plugin resets. Do not call `check_join` by name from your `check`: it may be `nil` or belong to another plugin. To share a rule between the two, put it in a `local function` and call that from both.
+- The check runs for every member listed in the join service message (`new_chat_members`), including members added by someone else, and only in the monitored group. The bot itself, superusers and approved users are skipped. Unban adds the user to the approved list, so a user banned by mistake is not banned again on rejoin.
+- A flagged member is banned like a reaction spammer: dry, training and soft-ban modes apply, and the admin chat gets a notification such as `permanently banned @user (123) on join by lua-names` with the `change ban` and `info` buttons. Unbanning from it does not add any text to ham samples.
+- Join message cleanup (`--delete.join-messages`, `--suppress-join-message`) works as before, and the check runs whether these are on or off.
+- With `--lua-plugins.dynamic-reload`, editing a plugin adds, replaces or removes its `check_join`. This applies to plugins loaded at startup; a new plugin file needs a restart, the same as for `check`.
+
+There are no extra settings: defining `check_join` in an enabled plugin turns the check on.
+
+**Available libraries.** Plugins get the base library without `dofile`, `loadfile`, `module` and `require`, the `string`, `table`, `math` and `coroutine` libraries, and an `os` table with only `clock`, `date`, `difftime` and `time`. Environment variables, files and commands are off: `io`, `package`, `debug` and the other `os` functions are `nil`, so a plugin can test for them, for example with `if os.getenv then`. The `http_request` helper is still available, so this limits what a plugin can reach on the host; it does not make an untrusted plugin safe to run. For plugins that need the full libraries, `--lua-plugins.unrestricted` (`$LUA_PLUGINS_UNRESTRICTED`) turns the restriction off. It is set only on the command line or in the environment, never in the web settings.
+
+A plugin that fails to load, for example because it calls a removed function at the top level, is skipped with a warning and the other plugins load. An enabled plugin that isn't loaded is skipped the same way. A skipped plugin needs a restart once it is fixed, also with `--lua-plugins.dynamic-reload`. A plugin that fails while checking a message or a join is logged once as a warning, and that check counts as not spam.
 
 Several helper functions are provided to Lua scripts:
 - `count_substring(text, substr)` - Counts occurrences of a substring
@@ -636,6 +710,7 @@ logger:
 
 cas:
       --cas.api=                        CAS API (default: https://api.cas.chat) [$CAS_API]
+      --cas.token=                      CAS API token (Combot API key), disabled if not set [$CAS_TOKEN]
       --cas.timeout=                    CAS timeout (default: 5s) [$CAS_TIMEOUT]
       --cas.user-agent=                 User-Agent header for CAS API requests [$CAS_USER_AGENT]
 
@@ -647,6 +722,7 @@ meta:
       --meta.links-only                 enable links only check [$META_LINKS_ONLY]
       --meta.mention-only               enable mention only check [$META_MENTION_ONLY]
       --meta.video-only                 enable video only check [$META_VIDEO_ONLY]
+      --meta.document-only              enable document only check [$META_DOCUMENT_ONLY]
       --meta.audio-only                 enable audio only check [$META_AUDIO_ONLY]
       --meta.contact-only               enable contact only check [$META_CONTACT_ONLY]
       --meta.forward                    enable forward check [$META_FORWARD]
@@ -667,7 +743,7 @@ openai:
       --openai.max-symbols-request=     openai max symbols in request, failback if tokenizer failed (default: 16000) [$OPENAI_MAX_SYMBOLS_REQUEST]
       --openai.retry-count=             openai retry count (default: 1) [$OPENAI_RETRY_COUNT]
       --openai.history-size=            openai history size (default: 0) [$OPENAI_HISTORY_SIZE]
-      --openai.reasoning-effort=[none|low|medium|high] reasoning effort for thinking models, none disables thinking (default: none) [$OPENAI_REASONING_EFFORT]
+      --openai.reasoning-effort=[none|off|low|medium|high] reasoning effort for thinking models, none leaves the model default, off disables thinking (default: none) [$OPENAI_REASONING_EFFORT]
       --openai.check-short-messages     check messages shorter than min-msg-len with OpenAI [$OPENAI_CHECK_SHORT_MESSAGES]
 
 gemini:
@@ -682,6 +758,21 @@ gemini:
       --gemini.history-size=            gemini history size (default: 0) [$GEMINI_HISTORY_SIZE]
       --gemini.check-short-messages     check messages shorter than min-msg-len with Gemini [$GEMINI_CHECK_SHORT_MESSAGES]
 
+jev:
+      --jev.token=                      jev token, disabled if not set [$JEV_TOKEN]
+      --jev.apibase=                    custom jev API base [$JEV_API_BASE]
+      --jev.veto                        veto mode, confirm detected spam [$JEV_VETO]
+      --jev.model=                      jev model, pinned version not an alias (default: jev-1.13.0) [$JEV_MODEL]
+      --jev.question=                   jev spam question (default: Is `message`, posted in a public Telegram group chat, spam?) [$JEV_QUESTION]
+      --jev.criteria-spam=              jev criteria for spam (default: It promotes, advertises, or offers paid services, paid subscriptions, paid content, donations, crypto wallets, paid promotion of content or accounts, job recruitment, hiring, looking for employees, unsolicited job postings, easy money offers, work-from-home offers with specific payment amounts, VPN promotion, or invitations to join Telegram bots or channels for earnings.) [$JEV_CRITERIA_SPAM]
+      --jev.criteria-ham=               jev criteria for ham (default: Ordinary conversation between chat members. Casual discussion or mentioning prices of well-known services and products such as GitHub Copilot, ChatGPT Plus, cloud providers or software tools is NOT spam. Off-topic banter, rudeness, profanity, questions, and links shared as part of a conversation are NOT spam. Only direct selling, promoting, or advertising counts as spam.) [$JEV_CRITERIA_HAM]
+      --jev.threshold=                  spam probability at or above this is spam (default: 0.30) [$JEV_THRESHOLD]
+      --jev.max-symbols-request=        jev max symbols in request (default: 6000) [$JEV_MAX_SYMBOLS_REQUEST]
+      --jev.retry-count=                jev retry count (default: 1) [$JEV_RETRY_COUNT]
+      --jev.history-size=               jev history size (default: 0) [$JEV_HISTORY_SIZE]
+      --jev.check-short-messages        check messages shorter than min-msg-len with jev [$JEV_CHECK_SHORT_MESSAGES]
+      --jev.gibberish-threshold=        gibberish probability at or above this is spam, 0 disables (default: 0) [$JEV_GIBBERISH_THRESHOLD]
+
 llm:
       --llm.consensus=[any|all]         how eligible LLMs flip the base decision (default: any) [$LLM_CONSENSUS]
       --llm.request-timeout=            timeout for individual LLM requests (default: 30s) [$LLM_REQUEST_TIMEOUT]
@@ -691,6 +782,7 @@ lua-plugins:
       --lua-plugins.plugins-dir=        directory with Lua plugins [$LUA_PLUGINS_PLUGINS_DIR]
       --lua-plugins.enabled-plugins=    list of enabled plugins (by name, without .lua extension) [$LUA_PLUGINS_ENABLED_PLUGINS]
       --lua-plugins.dynamic-reload      dynamically reload plugins when they change [$LUA_PLUGINS_DYNAMIC_RELOAD]
+      --lua-plugins.unrestricted        give plugins every Lua library, os and io included [$LUA_PLUGINS_UNRESTRICTED]
 
 space:
       --space.enabled                   enable abnormal words check [$SPACE_ENABLED]
@@ -728,7 +820,6 @@ message:
       --message.spam=                   spam message (default: this is spam) [$MESSAGE_SPAM]
       --message.dry=                    spam dry message (default: this is spam (dry mode)) [$MESSAGE_DRY]
       --message.warn=                   warning message (default: You've violated our rules and this is your first and last warning. Further violations will lead to permanent access denial. Stay compliant or face the consequences!) [$MESSAGE_WARN]
-      --message.restore=                restore message [$MESSAGE_RESTORE]
 
 server:
       --server.enabled                  enable web server [$SERVER_ENABLED]
@@ -762,6 +853,14 @@ Available commands:
 - `--dbg` - if set to `true`, the bot will print debug information to the console.
 - `--tg-dbg` - if set to `true`, the bot will print debug information from the telegram library to the console.
 
+## English samples
+
+The preset samples are mostly in Russian. The `data/en` directory holds an English set instead: 592 ham and 448 spam samples, plus copies of the preset excluded tokens and stop words. To use it, set `--files.samples=` (`$FILES_SAMPLES`) to a copy of that directory. In Docker, use `/srv/data/en` in the mounted data directory: the entrypoint creates it on a fresh volume, and an existing installation needs it copied once with `cp -r /srv/preset/en /srv/data/` inside the container. Do not point it at `/srv/preset/en` in the image, since the import would then repeat every time the container is recreated.
+
+When the bot finds the files there, it imports them into the database. The English samples replace the preset samples, and samples added by admins stay, except one with the same text as an imported sample, which takes the imported type. The excluded tokens and stop words replace all existing ones, including any added by admins. The bot renames each file to `*.loaded` after the import, so the import runs once for each copy.
+
+Sources and licence of the set are in [data/en/README.md](data/en/README.md).
+
 ## Running the bot with an empty set of samples
 
 The provided preset set of samples is just an example collected by the bot author. It is not enough to detect all the spam, in all groups and all languages. However, the bot is designed to learn on the fly, so it is possible to start with an empty set of samples and let the bot learn from the spam detected by humans.
@@ -779,7 +878,7 @@ After that, the moment admin run into a spam message, they could forward it to t
 
 In case if such an active training on a live system is not possible, the bot can be trained without banning user and deleting messages automatically. Setting `--training ` parameter will disable banning and deleting messages by bot right away, but the rest of the functionality will be the same. This is useful for testing and training purposes as bot can be trained on false-positive samples, by unbanning them in the admin chat as well as with false-negative samples by forwarding them to the bot. Alternatively, admin can reply to the spam message with the text `spam` or `/spam` to mark it as spam.
 
-In this mode admin can ban users manually by clicking the "confirm ban" button on the message. This allows running the bot as a post-moderation tool and training it on the fly.
+In this mode admin can ban users manually from the bot's ban notification in the admin chat: press "⛔︎ change ban", then "Confirm ban". This does not extend to user reports: **Approve Ban** on a report does not ban anyone in training mode. This allows running the bot as a post-moderation tool and training it on the fly.
 
 Pls note: Missed spam messages forwarded to the admin chat will be banned and removed from the primary chat group when possible. If the original message can't be located (e.g. after a bot restart), the bot will still ban the user when the sender's identity is available via Telegram's forward origin, and warn the admin to delete the original message manually.
 
@@ -941,18 +1040,6 @@ services:
     command: --super=name1 --super=name2 --super=name3
 ```
 
-## Getting spam samples from CAS
-
-CAS provide an API to get spam samples, which can be used to create a set of spam samples for the bot. Provided [`cas-export.sh`](https://raw.githubusercontent.com/umputun/tg-spam/master/cas-export.sh) script automate the process and result (`messages.txt`) can be used as a base for `spam-samples.txt` file. The script requires `jq` and `curl` to be installed and running it will take a long time.
-
-```bash
-curl -s https://raw.githubusercontent.com/umputun/tg-spam/master/cas-export.sh > cas-export.sh
-chmod +x cas-export.sh
-./cas-export.sh
-```
-
-Pls note: using results of this script directly as-is may not be such a good idea, because a particular chat group may have a different spam pattern. It is better to use it as a base by picking samples what seems appropriate for a given chat, and add more spam samples from the group itself.
-
 ## Updating spam and ham samples from remote git repository
 
 A small utility and docker container provided to update spam and ham samples from a remote git repository. The utility is designed to be run either as a docker container or as a standalone script or as a part of a cron job. For more details see [updater/README.md](https://github.com/umputun/tg-spam/tree/master/updater/README.md).
@@ -995,6 +1082,7 @@ func main() {
     MinMsgLen:        10,
     FirstMessageOnly: true,
     CasAPI:           "https://cas.example.com",
+    CasToken:         "your-combot-api-key",
     HTTPClient:       &http.Client{},
   })
 

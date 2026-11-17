@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -40,10 +41,12 @@ type Detector struct {
 	classifier        classifier
 	openaiChecker     *openAIChecker
 	geminiChecker     *geminiChecker
+	jevChecker        *jevChecker
 	duplicateDetector *duplicateDetector
 	reactionDetector  *reactionDetector
 	metaChecks        []MetaCheck
-	luaChecks         []plugin.Check // separate field for Lua plugin checks
+	luaChecks         []plugin.ResultCheck // separate field for Lua plugin checks
+	luaJoinChecks     []plugin.JoinCheck   // optional Lua check_join functions, run by CheckJoin
 	tokenizedSpam     []map[string]int
 	approvedUsers     map[string]approved.UserInfo
 	stopWords         []string
@@ -111,6 +114,7 @@ type Config struct {
 	MaxShortMsgCount    int              // ban unapproved user after N short messages without graduation (0 disables)
 	MaxAllowedEmoji     int              // maximum number of emojis allowed in a message
 	CasAPI              string           // CAS API URL
+	CasToken            string           // CAS API token (Combot API key), CAS check is skipped if empty
 	CasUserAgent        string           // CAS API User-Agent header value, set only if non-empty
 	FirstMessageOnly    bool             // if true, only the first message from a user is checked
 	FirstMessagesCount  int              // number of first messages to check for spam
@@ -120,6 +124,8 @@ type Config struct {
 	OpenAIHistorySize   int              // history size for openai
 	GeminiVeto          bool             // if true, gemini vetos spam, otherwise vetos ham
 	GeminiHistorySize   int              // history size for gemini
+	JevVeto             bool             // if true, jev vetos spam, otherwise vetos ham
+	JevHistorySize      int              // history size for jev
 	LLMConsensus        LLMConsensusMode // how eligible LLM checks flip the base decision
 	LLMRequestTimeout   time.Duration    // timeout for individual LLM requests, if not set - 30s default
 	MultiLangWords      int              // if true, check for number of multi-lingual words
@@ -196,6 +202,16 @@ type LuaPluginEngine interface {
 	Close()                                     // cleans up resources
 }
 
+type luaResultEngine interface {
+	GetResultCheck(name string) (plugin.ResultCheck, error)
+	GetAllResultChecks() map[string]plugin.ResultCheck
+}
+
+type luaJoinEngine interface {
+	GetJoinCheck(name string) (plugin.JoinCheck, error)
+	GetAllJoinChecks() map[string]plugin.JoinCheck
+}
+
 // LoadResult is a result of loading samples.
 type LoadResult struct {
 	ExcludedTokens int // number of excluded tokens
@@ -212,7 +228,7 @@ func NewDetector(p Config) *Detector {
 		approvedUsers:     make(map[string]approved.UserInfo),
 		tokenizedSpam:     []map[string]int{},
 		metaChecks:        []MetaCheck{},
-		luaChecks:         []plugin.Check{},
+		luaChecks:         []plugin.ResultCheck{},
 		hamHistory:        spamcheck.NewLastRequests(p.HistorySize),
 		spamHistory:       spamcheck.NewLastRequests(p.HistorySize),
 		duplicateDetector: newDuplicateDetector(p.DuplicateDetection.Threshold, p.DuplicateDetection.Window),
@@ -288,6 +304,7 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 	}
 
 	// all the remaining checks are performed sequentially, so we can collect all the results
+	luaApprovers := make([]string, 0)
 
 	// check for stop words if any stop words are loaded
 	if len(d.stopWords) > 0 {
@@ -306,11 +323,14 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 
 	// check for spam with Lua plugin checks
 	for _, lc := range d.luaChecks {
-		cr = append(cr, lc(req))
+		result := lc(req)
+		cr = append(cr, result.Response)
+		if result.Approved && !result.Response.Spam && result.Response.Error == nil && result.Response.Name != "" {
+			luaApprovers = append(luaApprovers, result.Response.Name)
+		}
 	}
 
-	// check for spam with CAS API if CAS API URL is set
-	if d.CasAPI != "" {
+	if d.CasAPI != "" && d.CasToken != "" {
 		cr = append(cr, d.isCasSpam(req.UserID))
 	}
 
@@ -334,9 +354,14 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 		// 3. LLM checkers are configured but LLMs won't run (FirstMessageOnly/FirstMessagesCount not set)
 		openaiChecksShort := d.openaiChecker != nil && d.openaiChecker.params.CheckShortMessagesWithOpenAI
 		geminiChecksShort := d.geminiChecker != nil && d.geminiChecker.params.CheckShortMessages
+		jevChecksShort := d.jevChecker != nil && d.jevChecker.params.CheckShortMessages
 		llmEligible := d.FirstMessageOnly || d.FirstMessagesCount > 0
-		if isSpamDetected(cr) || !llmEligible || (!openaiChecksShort && !geminiChecksShort) {
-			if isSpamDetected(cr) {
+		softSpam := isSpamDetected(cr)
+		if softSpam || !llmEligible || (!openaiChecksShort && !geminiChecksShort && !jevChecksShort) {
+			if softSpam {
+				if approval, ok := luaApprovalResponse(luaApprovers); ok {
+					return false, append(cr, approval)
+				}
 				d.spamHistory.Push(req)
 				return true, cr // spam from the checks above
 			}
@@ -362,14 +387,22 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 
 	baseSpam := isSpamDetected(cr)
 	spamDetected := baseSpam
+	luaApproved := false
+	if baseSpam {
+		if approval, ok := luaApprovalResponse(luaApprovers); ok {
+			cr = append(cr, approval)
+			spamDetected = false
+			luaApproved = true
+		}
+	}
 
 	// we hit eligible LLMs in three cases:
 	//  - short message with short-message checking enabled (ignores veto mode since there's no decision to veto)
 	//  - all checks passed (ham) and veto is false - improves false negative rate
 	//  - checks failed (spam) and veto is true - improves false positive rate
 	// FirstMessageOnly or FirstMessagesCount has to be set to use LLMs, because they are slow and expensive to run on all messages
-	if d.FirstMessageOnly || d.FirstMessagesCount > 0 {
-		llmResults := make([]detectorLLMResult, 0, 2)
+	if !luaApproved && (d.FirstMessageOnly || d.FirstMessagesCount > 0) {
+		llmResults := make([]detectorLLMResult, 0, 3)
 		llmChecks := []detectorLLMCheck{
 			{
 				name:               "openai",
@@ -389,6 +422,16 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 				historySize:        d.GeminiHistorySize,
 				check: func(ctx context.Context, msg string, history []spamcheck.Request) (bool, spamcheck.Response) {
 					return d.geminiChecker.check(ctx, msg, history)
+				},
+			},
+			{
+				name:               "jev",
+				enabled:            d.jevChecker != nil,
+				checkShortMessages: d.jevChecker != nil && d.jevChecker.params.CheckShortMessages,
+				veto:               d.JevVeto,
+				historySize:        d.JevHistorySize,
+				check: func(ctx context.Context, msg string, history []spamcheck.Request) (bool, spamcheck.Response) {
+					return d.jevChecker.check(ctx, msg, history, req.Quote == "")
 				},
 			},
 		}
@@ -440,6 +483,23 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 	}
 	d.hamHistory.Push(req)
 	return false, cr
+}
+
+func luaApprovalResponse(names []string) (spamcheck.Response, bool) {
+	if len(names) == 0 {
+		return spamcheck.Response{}, false
+	}
+
+	unique := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		unique[name] = struct{}{}
+	}
+	uniqueNames := make([]string, 0, len(unique))
+	for name := range unique {
+		uniqueNames = append(uniqueNames, name)
+	}
+	sort.Strings(uniqueNames)
+	return spamcheck.Response{Name: "lua-approve", Details: "cleared by " + strings.Join(uniqueNames, ", ")}, true
 }
 
 func (d *Detector) normalizeLLMConsensusMode(mode LLMConsensusMode) LLMConsensusMode {
@@ -548,6 +608,7 @@ func (d *Detector) Reset() {
 		d.luaEngine.Close()
 		d.luaEngine = nil
 		d.luaChecks = nil
+		d.luaJoinChecks = nil
 	}
 }
 
@@ -561,7 +622,20 @@ func (d *Detector) WithGeminiChecker(client geminiClient, config GeminiConfig) {
 	d.geminiChecker = newGeminiChecker(client, config)
 }
 
-// WithLuaEngine sets a Lua plugin engine and loads plugins
+// WithJevChecker sets a jevChecker for spam checking. It returns the constructor's validation
+// error and leaves the detector without a jev checker in that case, so a rejected config can
+// never be half-applied.
+func (d *Detector) WithJevChecker(client HTTPClient, config JevConfig) error {
+	checker, err := newJevChecker(client, config)
+	if err != nil {
+		return fmt.Errorf("failed to create jev checker: %w", err)
+	}
+	d.jevChecker = checker
+	return nil
+}
+
+// WithLuaEngine sets a Lua plugin engine and loads plugins. An enabled plugin that isn't loaded is skipped
+// with a warning, and the rest are registered.
 func (d *Detector) WithLuaEngine(engine LuaPluginEngine) error {
 	d.luaEngine = engine
 
@@ -573,23 +647,61 @@ func (d *Detector) WithLuaEngine(engine LuaPluginEngine) error {
 	if err := d.luaEngine.LoadDirectory(d.LuaPlugins.PluginsDir); err != nil {
 		return fmt.Errorf("failed to load Lua plugins: %w", err)
 	}
+	resultEngine, supportsResults := engine.(luaResultEngine)
 
 	// register enabled plugins as Lua checks
 	if len(d.LuaPlugins.EnabledPlugins) > 0 {
 		for _, name := range d.LuaPlugins.EnabledPlugins {
+			if supportsResults {
+				pluginCheck, err := resultEngine.GetResultCheck(name)
+				if err != nil {
+					log.Printf("[WARN] skipped Lua plugin %q: %v", name, err)
+					continue
+				}
+				d.luaChecks = append(d.luaChecks, pluginCheck)
+				continue
+			}
+
 			pluginCheck, err := d.luaEngine.GetCheck(name)
 			if err != nil {
-				return fmt.Errorf("failed to get Lua check %q: %w", name, err)
+				log.Printf("[WARN] skipped Lua plugin %q: %v", name, err)
+				continue
 			}
-			// add to luaChecks
-			d.luaChecks = append(d.luaChecks, pluginCheck)
+			d.luaChecks = append(d.luaChecks, func(req spamcheck.Request) plugin.Result {
+				return plugin.Result{Response: pluginCheck(req)}
+			})
 		}
 	} else {
 		// if no specific plugins are enabled, load all
-		allChecks := d.luaEngine.GetAllChecks()
-		for _, pluginCheck := range allChecks {
-			// add to luaChecks
-			d.luaChecks = append(d.luaChecks, pluginCheck)
+		if supportsResults {
+			for _, pluginCheck := range resultEngine.GetAllResultChecks() {
+				d.luaChecks = append(d.luaChecks, pluginCheck)
+			}
+		} else {
+			for _, pluginCheck := range d.luaEngine.GetAllChecks() {
+				check := pluginCheck
+				d.luaChecks = append(d.luaChecks, func(req spamcheck.Request) plugin.Result {
+					return plugin.Result{Response: check(req)}
+				})
+			}
+		}
+	}
+
+	// register join checks from the same plugins, if the engine supports them
+	if joinEngine, ok := engine.(luaJoinEngine); ok {
+		if len(d.LuaPlugins.EnabledPlugins) > 0 {
+			for _, name := range d.LuaPlugins.EnabledPlugins {
+				joinCheck, err := joinEngine.GetJoinCheck(name)
+				if err != nil {
+					log.Printf("[WARN] skipped Lua join check %q: %v", name, err)
+					continue
+				}
+				d.luaJoinChecks = append(d.luaJoinChecks, joinCheck)
+			}
+		} else {
+			for _, joinCheck := range joinEngine.GetAllJoinChecks() {
+				d.luaJoinChecks = append(d.luaJoinChecks, joinCheck)
+			}
 		}
 	}
 
@@ -686,6 +798,22 @@ func (d *Detector) approvedCount(userID string) int {
 	return d.approvedUsers[userID].Count
 }
 
+// ForgetMessage removes a message from the duplicate history only, so it stops counting toward the
+// duplicates threshold. For a message whose text was edited away and that is not checked anymore.
+func (d *Detector) ForgetMessage(userID string, msgID int) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	if d.duplicateDetector == nil {
+		return
+	}
+	id, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil {
+		return
+	}
+	d.duplicateDetector.forgetMessage(id, msgID)
+}
+
 // IsApprovedUser checks if a given user ID is approved.
 // It uses memory cache for approved users and compares the count of messages sent by the user.
 func (d *Detector) IsApprovedUser(userID string) bool {
@@ -765,6 +893,26 @@ func (d *Detector) GetLuaPluginNames() []string {
 	// sort the result for consistent output
 	sort.Strings(result)
 	return result
+}
+
+// CheckJoin runs the Lua check_join functions for a new chat member. It is spam when at least one
+// plugin reports spam without an error. Plugins without check_join give no response. It does not
+// touch approved users, history or the LLM checks.
+func (d *Detector) CheckJoin(req spamcheck.Request) (spam bool, cr []spamcheck.Response) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	for _, joinCheck := range d.luaJoinChecks {
+		resp, ok := joinCheck(req)
+		if !ok {
+			continue
+		}
+		cr = append(cr, resp)
+		if resp.Spam && resp.Error == nil {
+			spam = true
+		}
+	}
+	return spam, cr
 }
 
 // LoadSamples loads spam samples from a reader and updates the classifier.
@@ -1003,6 +1151,9 @@ func (d *Detector) cosineSimilarity(a, b map[string]int) float64 {
 	return float64(dotProduct) / (math.Sqrt(float64(normA)) * math.Sqrt(float64(normB)))
 }
 
+// errCasAuth marks a CAS response rejecting the token, which ends retries.
+var errCasAuth = errors.New("cas token rejected")
+
 // isCasSpam checks if a given user ID is a spammer with CAS API.
 func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 	if msgID == "" {
@@ -1017,6 +1168,8 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to make request %s: %v", reqURL, err)}
 	}
 
+	// header, not the api_key query parameter: reqURL goes into Details and log lines
+	req.Header.Set("Authorization", "Bearer "+d.CasToken)
 	if d.CasUserAgent != "" {
 		req.Header.Set("User-Agent", d.CasUserAgent)
 	}
@@ -1043,6 +1196,12 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 			return fmt.Errorf("server error: %d", resp.StatusCode)
 		}
 
+		// a rejected token is rejected again on every retry
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			_ = resp.Body.Close()
+			return fmt.Errorf("unexpected status: %d: %w", resp.StatusCode, errCasAuth)
+		}
+
 		// retry on non-200 status
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
@@ -1057,10 +1216,10 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 		}
 
 		return nil // success - exit retry loop
-	})
+	}, errCasAuth)
 
 	if err != nil {
-		log.Printf("[WARN] CAS API request failed for user %s after retries: %v", msgID, err)
+		log.Printf("[WARN] CAS API request failed for user %s: %v", msgID, err)
 		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to send request %s: %v", reqURL, err)}
 	}
 	defer resp.Body.Close()

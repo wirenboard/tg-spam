@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,8 @@ type Locator interface {
 type Bot interface {
 	OnMessage(msg bot.Message, checkOnly bool) (response bot.Response)
 	OnReaction(userID int64, userName string) bot.Response
+	OnJoin(user bot.User) bot.Response
+	ForgetMessage(msg bot.Message)
 	UpdateSpam(msg string) error
 	UpdateHam(msg string) error
 	AddApprovedUser(id int64, name string) error
@@ -62,6 +65,24 @@ func escapeMarkDownV1Text(text string) string {
 	return text
 }
 
+// markdownV1LinkLabel makes text safe as a legacy markdown link label. Telegram copies a label verbatim
+// up to the first "]" and applies no escapes inside it, so "\\]" cannot keep "]" in the label and other
+// escapes would show as text. "]" is removed instead: left in an arbitrary first+last display name it
+// would end the label early and let the name inject its own link.
+func markdownV1LinkLabel(text string) string {
+	return strings.ReplaceAll(text, "]", "")
+}
+
+// botTokenRe matches a Telegram bot token. the Bot API client puts the token in its request URLs, so
+// a network error from it carries the token
+var botTokenRe = regexp.MustCompile(`\d{5,}:[A-Za-z0-9_-]{30,}`)
+
+// redactBotToken masks any bot token in text the bot is about to post. the log setup masks secrets in
+// log output, but not in messages sent to a chat
+func redactBotToken(text string) string {
+	return botTokenRe.ReplaceAllString(text, "xxxxx")
+}
+
 // truncateString truncates a string to maxRunes runes (not bytes) and appends suffix if truncated.
 // this is safe for multi-byte UTF-8 characters (emoji, cyrillic, etc.)
 //
@@ -74,17 +95,8 @@ func truncateString(s string, maxRunes int, suffix string) string {
 	return string(runes[:maxRunes]) + suffix
 }
 
-// send delivers tbMsg with the fallback cascade of sendReturning, discarding the sent message.
+// send a message to the telegram as markdown first and if failed - as plain text
 func send(tbMsg tbapi.Chattable, tbAPI TbAPI) error {
-	_, err := sendReturning(tbMsg, tbAPI)
-	return err
-}
-
-// sendReturning delivers tbMsg and returns the message telegram created, for callers that need
-// its ID. Markdown is tried first because it renders nicer, then HTML for texts carrying a
-// tg://user link, then plain text: a username with underscores makes telegram reject markdown,
-// and the message must still be delivered.
-func sendReturning(tbMsg tbapi.Chattable, tbAPI TbAPI) (tbapi.Message, error) {
 	withParseMode := func(tbMsg tbapi.Chattable, parseMode string) tbapi.Chattable {
 		switch msg := tbMsg.(type) {
 		case tbapi.MessageConfig:
@@ -111,29 +123,33 @@ func sendReturning(tbMsg tbapi.Chattable, tbAPI TbAPI) (tbapi.Message, error) {
 	}
 
 	// try markdown first, as it's the nicer rendering
-	sent, err := tbAPI.Send(withParseMode(tbMsg, tbapi.ModeMarkdown))
-	if err == nil {
-		return sent, nil
-	}
-	log.Printf("[WARN] failed to send message as markdown, %v", err)
+	msg := withParseMode(tbMsg, tbapi.ModeMarkdown)
+	if _, err := tbAPI.Send(msg); err != nil {
+		log.Printf("[WARN] failed to send message as markdown, %v", err)
 
-	// for messages with Telegram profile links, we need to ensure the links are preserved
-	// when falling back to plain text, even if markdown fails
-	if hasTelegramProfileLink {
-		// use HTML mode as a fallback, which better handles usernames with special characters
-		htmlSent, htmlErr := tbAPI.Send(withParseMode(tbMsg, tbapi.ModeHTML))
-		if htmlErr == nil {
-			return htmlSent, nil
+		// for messages with Telegram profile links, we need to ensure the links are preserved
+		// when falling back to plain text, even if markdown fails
+		if hasTelegramProfileLink {
+			// use HTML mode as a fallback, which better handles usernames with special characters
+			htmlMsg := withParseMode(tbMsg, tbapi.ModeHTML)
+			if _, err := tbAPI.Send(htmlMsg); err != nil {
+				// if HTML also fails, fall back to plain text
+				log.Printf("[WARN] failed to send message as HTML, %v", err)
+				plainMsg := withParseMode(tbMsg, "") // plain text
+				if _, err := tbAPI.Send(plainMsg); err != nil {
+					return fmt.Errorf("can't send message to telegram: %w", err)
+				}
+			}
+			return nil
 		}
-		// if HTML also fails, fall back to plain text
-		log.Printf("[WARN] failed to send message as HTML, %v", htmlErr)
-	}
 
-	sent, err = tbAPI.Send(withParseMode(tbMsg, "")) // plain text
-	if err != nil {
-		return tbapi.Message{}, fmt.Errorf("can't send message to telegram: %w", err)
+		// for regular messages, just fall back to plain text
+		msg = withParseMode(tbMsg, "")
+		if _, err := tbAPI.Send(msg); err != nil {
+			return fmt.Errorf("can't send message to telegram: %w", err)
+		}
 	}
-	return sent, nil
+	return nil
 }
 
 type banRequest struct {
@@ -349,6 +365,9 @@ func transform(msg *tbapi.Message) *bot.Message {
 	if msg.Audio != nil {
 		message.WithAudio = true
 	}
+	if msg.Document != nil {
+		message.WithDocument = true
+	}
 	if msg.ForwardOrigin != nil {
 		message.WithForward = true
 	}
@@ -399,31 +418,63 @@ func transform(msg *tbapi.Message) *bot.Message {
 		message.Quote = msg.Quote.Text
 	}
 
-	// handle caption - either as main text if no text present, or append to existing text
-	if msg.Caption != "" {
-		if message.Text == "" {
-			log.Printf("[DEBUG] caption only message: %q", msg.Caption)
-			message.Text = msg.Caption
-		} else {
-			log.Printf("[DEBUG] caption appended to message: %q", msg.Caption)
-			message.Text += "\n" + msg.Caption
+	// caption and structured content carry text outside msg.Text; a message whose text stays
+	// empty is dropped by the listener before any spam check runs
+	addText := func(kind, s string) {
+		if s == "" {
+			return
 		}
-	}
-
-	// handle rich messages (the client "article" compose type, bot api 10.2): their text
-	// lives in structured blocks with an empty msg.Text, so flatten it into the message text
-	// to let content checks and the llm see the content
-	if rt := richMessageText(msg.RichMessage); rt != "" {
 		if message.Text == "" {
-			log.Printf("[DEBUG] rich message flattened to text: %q", rt)
-			message.Text = rt
-		} else {
-			log.Printf("[DEBUG] rich message appended to text: %q", rt)
-			message.Text += "\n" + rt
+			log.Printf("[DEBUG] %s only message: %q", kind, s)
+			message.Text = s
+			return
 		}
+		log.Printf("[DEBUG] %s appended to message: %q", kind, s)
+		message.Text += "\n" + s
 	}
+	addText("caption", msg.Caption)
+	addText("rich message", richMessageText(msg.RichMessage))
+	addText("checklist", checklistText(msg.Checklist))
+	addText("poll", pollText(msg.Poll))
 
 	return &message
+}
+
+// checklistText flattens a checklist into its title followed by task texts, one per line.
+func checklistText(cl *tbapi.Checklist) string {
+	if cl == nil {
+		return ""
+	}
+	parts := []string{cl.Title}
+	for _, task := range cl.Tasks {
+		parts = append(parts, task.Text)
+	}
+	return joinNonEmpty(parts)
+}
+
+// pollText flattens a poll into its question, description, option texts and quiz explanation,
+// one per line.
+func pollText(p *tbapi.Poll) string {
+	if p == nil {
+		return ""
+	}
+	parts := []string{p.Question, p.Description}
+	for _, opt := range p.Options {
+		parts = append(parts, opt.Text)
+	}
+	parts = append(parts, p.Explanation)
+	return joinNonEmpty(parts)
+}
+
+// joinNonEmpty joins the non-empty strings with a newline.
+func joinNonEmpty(parts []string) string {
+	res := make([]string, 0, len(parts))
+	for _, s := range parts {
+		if s != "" {
+			res = append(res, s)
+		}
+	}
+	return strings.Join(res, "\n")
 }
 
 // richMessageText flattens a telegram rich message (the client "article" compose type,
@@ -491,29 +542,25 @@ func richMessageText(rm *tbapi.RichMessage) string {
 	return strings.Join(lines, "\n")
 }
 
-// stripCallbackPrefix removes the action prefix from callback data if present.
-// two-char report prefixes (R+, R-, R?, R!, RX) are checked before single-char ones.
-func stripCallbackPrefix(data string) string {
-	if len(data) >= 3 && data[:1] == "R" {
-		return data[2:]
-	}
-	if len(data) >= 1 && (data[:1] == "?" || data[:1] == "+" || data[:1] == "!") {
-		return data[1:]
-	}
-	return data
-}
-
-// parseCallbackData parses callback data format: [prefix]userID:msgID[:spamReplyID]
+// parseCallbackData parses callback data format: [prefix]userID:msgID
 // prefix can be: ?, +, !, or two-char report prefixes (R+, R-, R?, R!, RX)
 func parseCallbackData(data string) (userID int64, msgID int, err error) {
 	if len(data) < 3 {
 		return 0, 0, fmt.Errorf("unexpected callback data, too short %q", data)
 	}
 
-	data = stripCallbackPrefix(data)
+	// remove prefix if present from the parsed data
+	// check for two-char report prefixes first (R+, R-, R?, R!, RX)
+	if len(data) >= 3 && data[:1] == "R" {
+		// two-char report prefix
+		data = data[2:]
+	} else if data[:1] == "?" || data[:1] == "+" || data[:1] == "!" {
+		// single-char prefix
+		data = data[1:]
+	}
 
 	parts := strings.Split(data, ":")
-	if len(parts) < 2 {
+	if len(parts) != 2 {
 		return 0, 0, fmt.Errorf("unexpected callback data, should have both ids %q", data)
 	}
 	if userID, err = strconv.ParseInt(parts[0], 10, 64); err != nil {

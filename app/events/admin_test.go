@@ -38,7 +38,7 @@ func TestAdmin_reportBan(t *testing.T) {
 
 	t.Run("normal user name", func(t *testing.T) {
 		mockAPI.ResetCalls()
-		adm.ReportBan("testUser", msg, 0)
+		adm.ReportBan("testUser", msg)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		t.Logf("sent text: %+v", mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text)
@@ -52,7 +52,7 @@ func TestAdmin_reportBan(t *testing.T) {
 
 	t.Run("name with md chars", func(t *testing.T) {
 		mockAPI.ResetCalls()
-		adm.ReportBan("test_User", msg, 0)
+		adm.ReportBan("test_User", msg)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		t.Logf("sent text: %+v", mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text)
@@ -71,7 +71,7 @@ func TestAdmin_reportBan(t *testing.T) {
 			Text:  "Спасибо!!",
 			Quote: "Бесплатный VPN для Telegram",
 		}
-		adm.ReportBan("spammer", msgWithQuote, 0)
+		adm.ReportBan("spammer", msgWithQuote)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		sentText := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
@@ -183,6 +183,10 @@ func TestAdmin_extractUsername(t *testing.T) {
 		{name: "reaction rendered", banMessage: "permanently banned @spammer (42) reaction spammer", expectedResult: "@spammer"},
 		{name: "reaction rendered dry", banMessage: "[dry run] would have permanently banned @spammer (42) reaction spammer", expectedResult: "@spammer"},
 		{name: "reaction rendered training", banMessage: "[training] would have permanently banned @spammer (42) reaction spammer", expectedResult: "@spammer"},
+		{name: "join rendered soft-ban", banMessage: "restricted @spammer (42) on join by lua-names", expectedResult: "@spammer"},
+		{name: "join rendered", banMessage: "permanently banned Green Shop (42) on join by lua-names", expectedResult: "Green Shop"},
+		{name: "ban with restricted in body", banMessage: "permanently banned @spammer (42)\n\nrestricted foo (123) text",
+			expectedResult: "@spammer"},
 		{name: "invalid format", banMessage: "permanently banned John_Doe some message text", expectError: true},
 	}
 
@@ -212,7 +216,7 @@ func TestAdmin_dryModeForwardMessage(t *testing.T) {
 	}
 	msg := &bot.Message{}
 
-	adm.ReportBan("testUser", msg, 0)
+	adm.ReportBan("testUser", msg)
 	assert.Contains(t, mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text, "would have permanently banned [testUser]")
 }
 
@@ -232,7 +236,7 @@ func TestAdmin_reportBanChannel(t *testing.T) {
 			SenderChat: bot.SenderChat{ID: -100999888, UserName: "spamchannel"},
 			Text:       "spam from channel",
 		}
-		adm.ReportBan("spamchannel", msg, 0)
+		adm.ReportBan("spamchannel", msg)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		sentText := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
@@ -253,7 +257,7 @@ func TestAdmin_reportBanChannel(t *testing.T) {
 			SenderChat: bot.SenderChat{ID: -100999888},
 			Text:       "spam from channel",
 		}
-		adm.ReportBan("Some Channel", msg, 0)
+		adm.ReportBan("Some Channel", msg)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		sentText := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
@@ -267,7 +271,7 @@ func TestAdmin_reportBanChannel(t *testing.T) {
 			From: bot.User{ID: 456, Username: "spammer"},
 			Text: "spam from user",
 		}
-		adm.ReportBan("spammer", msg, 0)
+		adm.ReportBan("spammer", msg)
 
 		require.Len(t, mockAPI.SendCalls(), 1)
 		sentText := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
@@ -544,6 +548,76 @@ func TestAdmin_DirectCommands(t *testing.T) {
 		}
 
 		require.Len(t, botMock.UpdateSpamCalls(), 1)
+		require.Len(t, mockAPI.SendCalls(), 1)
+		assert.Contains(t, mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text, "ban skipped")
+	})
+
+	t.Run("DirectSpamReport_LinkedChannel", func(t *testing.T) {
+		mockAPI, botMock, adm, teardown := setupTest()
+		defer teardown()
+		adm.linkedChannelID = -1001234567890
+
+		// post made by the channel linked to the group, e.g. an automatic forward of a channel post
+		update := tbapi.Update{
+			Message: &tbapi.Message{
+				MessageID: 789,
+				Chat:      tbapi.Chat{ID: 123},
+				From:      &tbapi.User{UserName: "admin", ID: 111},
+				ReplyToMessage: &tbapi.Message{
+					MessageID:  999,
+					From:       &tbapi.User{UserName: "Channel_Bot", ID: 136817688},
+					SenderChat: &tbapi.Chat{ID: -1001234567890, UserName: "linked_channel", Type: "channel"},
+					Text:       "channel post",
+				},
+			},
+		}
+
+		err := adm.DirectSpamReport(update)
+		require.NoError(t, err)
+
+		// only the two deletes, no ban: banning the linked channel stops it posting in its own discussion group
+		require.Len(t, mockAPI.RequestCalls(), 2)
+		assert.Equal(t, 999, mockAPI.RequestCalls()[0].C.(tbapi.DeleteMessageConfig).MessageID)
+		assert.Equal(t, 789, mockAPI.RequestCalls()[1].C.(tbapi.DeleteMessageConfig).MessageID)
+		require.Len(t, botMock.UpdateSpamCalls(), 1)
+
+		// the admin chat is told the ban was skipped, not that it happened
+		require.Len(t, mockAPI.SendCalls(), 1)
+		adminMsg := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
+		assert.Contains(t, adminMsg, "ban skipped")
+		assert.NotContains(t, adminMsg, "the user banned")
+	})
+
+	t.Run("DirectSpamReport_OtherChannelWithLinkedChannelSet", func(t *testing.T) {
+		mockAPI, _, adm, teardown := setupTest()
+		defer teardown()
+		adm.linkedChannelID = -1001234567890
+
+		update := tbapi.Update{
+			Message: &tbapi.Message{
+				MessageID: 789,
+				Chat:      tbapi.Chat{ID: 123},
+				From:      &tbapi.User{UserName: "admin", ID: 111},
+				ReplyToMessage: &tbapi.Message{
+					MessageID:  999,
+					From:       &tbapi.User{UserName: "Channel_Bot", ID: 136817688},
+					SenderChat: &tbapi.Chat{ID: -1009999999999, UserName: "spam_channel", Type: "channel"},
+					Text:       "spam message text",
+				},
+			},
+		}
+
+		err := adm.DirectSpamReport(update)
+		require.NoError(t, err)
+
+		// any other channel is still banned
+		var bannedChannels []int64
+		for _, call := range mockAPI.RequestCalls() {
+			if banCfg, ok := call.C.(tbapi.BanChatSenderChatConfig); ok {
+				bannedChannels = append(bannedChannels, banCfg.SenderChatID)
+			}
+		}
+		assert.Equal(t, []int64{-1009999999999}, bannedChannels)
 	})
 
 	t.Run("DirectWarnReport_ChannelMessage", func(t *testing.T) {
@@ -1019,6 +1093,36 @@ func TestAdmin_DirectWarnReport_AutoBan(t *testing.T) {
 		assert.Empty(t, warningsMock.CountWithinCalls(), "anonymous admin posts must not query count")
 		assert.Equal(t, 0, countMemberBans(mockAPI), "must not ban anything")
 		assert.Equal(t, 0, countChannelBans(mockAPI), "must not ban the group itself")
+	})
+
+	t.Run("linked channel post skips auto-ban", func(t *testing.T) {
+		mockAPI, warningsMock, adm := setupTest()
+		adm.linkedChannelID = -1001234567890
+		warningsMock.CountWithinFunc = func(ctx context.Context, userID int64, window time.Duration) (int, error) {
+			return 5, nil // well above threshold
+		}
+
+		update := tbapi.Update{
+			Message: &tbapi.Message{
+				MessageID: 789,
+				Chat:      tbapi.Chat{ID: 123},
+				From:      &tbapi.User{UserName: "admin", ID: 111},
+				ReplyToMessage: &tbapi.Message{
+					MessageID:  999,
+					From:       &tbapi.User{UserName: "Channel_Bot", ID: 136817688},
+					SenderChat: &tbapi.Chat{ID: -1001234567890, Title: "linked channel", Type: "channel"},
+					Text:       "channel post",
+				},
+			},
+		}
+
+		err := adm.DirectWarnReport(update)
+		require.NoError(t, err)
+
+		assert.Empty(t, warningsMock.AddCalls(), "linked channel posts must not record a warn")
+		assert.Empty(t, warningsMock.CountWithinCalls(), "linked channel posts must not query count")
+		assert.Equal(t, 0, countMemberBans(mockAPI), "must not ban anything")
+		assert.Equal(t, 0, countChannelBans(mockAPI), "must not ban the linked channel")
 	})
 
 	t.Run("soft-ban with channel target falls through to banned (no restrict for channels)", func(t *testing.T) {
@@ -2067,6 +2171,66 @@ func TestAdmin_MsgHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("linked channel post skips ban in MsgHandler", func(t *testing.T) {
+		mockAPI := &mocks.TbAPIMock{
+			RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) {
+				return &tbapi.APIResponse{Ok: true}, nil
+			},
+			SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) {
+				return tbapi.Message{Text: "test"}, nil
+			},
+		}
+
+		botMock := &mocks.BotMock{
+			RemoveApprovedUserFunc: func(id int64) error { return nil },
+			OnMessageFunc: func(msg bot.Message, checkOnly bool) bot.Response {
+				return bot.Response{CheckResults: []spamcheck.Response{{Name: "test", Spam: true, Details: "spam"}}}
+			},
+			UpdateSpamFunc: func(msg string) error { return nil },
+		}
+
+		// locator stores linked channel posts under the channel ID
+		locatorMock := &mocks.LocatorMock{
+			MessageFunc: func(ctx context.Context, msg string) (storage.MsgMeta, bool) {
+				return storage.MsgMeta{UserID: -1001234567890, UserName: "linked_channel", MsgID: 999}, true
+			},
+			SpamFunc: func(ctx context.Context, userID int64) (storage.SpamData, bool) {
+				return storage.SpamData{}, true
+			},
+		}
+
+		adm := admin{
+			tbAPI: mockAPI, bot: botMock, locator: locatorMock,
+			primChatID: 123, linkedChannelID: -1001234567890, adminChatID: 456, superUsers: SuperUsers{"superuser"},
+		}
+
+		msg := &tbapi.Message{
+			MessageID: 789, Chat: tbapi.Chat{ID: 456},
+			From: &tbapi.User{UserName: "admin", ID: 111},
+			Text: "channel post forwarded",
+			ForwardOrigin: &tbapi.MessageOrigin{
+				Type:      "channel",
+				Chat:      &tbapi.Chat{ID: -1001234567890, UserName: "linked_channel", Type: "channel"},
+				MessageID: 42,
+			},
+		}
+
+		err := adm.MsgHandler(tbapi.Update{Message: msg})
+		require.NoError(t, err)
+		require.Len(t, locatorMock.MessageCalls(), 1)
+
+		for _, call := range mockAPI.RequestCalls() {
+			_, isChannelBan := call.C.(tbapi.BanChatSenderChatConfig)
+			assert.False(t, isChannelBan, "should not ban the linked channel")
+			_, isMemberBan := call.C.(tbapi.BanChatMemberConfig)
+			assert.False(t, isMemberBan, "should not ban member for a linked channel post")
+		}
+		require.Len(t, mockAPI.SendCalls(), 1)
+		adminMsg := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig).Text
+		assert.Contains(t, adminMsg, "ban skipped")
+		assert.NotContains(t, adminMsg, "the user banned")
+	})
+
 	t.Run("message not found in locator with hidden user", func(t *testing.T) {
 		mockAPI := &mocks.TbAPIMock{}
 		botMock := &mocks.BotMock{}
@@ -2547,6 +2711,68 @@ func TestAdmin_MsgHandlerFallback(t *testing.T) {
 	})
 }
 
+func TestAdmin_MsgHandlerChecksTransformedText(t *testing.T) {
+	tests := []struct {
+		name       string
+		locatorHit bool
+		msg        tbapi.Message
+		expected   string
+	}{
+		{
+			name: "checklist, locator hit", locatorHit: true,
+			msg:      tbapi.Message{Checklist: &tbapi.Checklist{Title: "title", Tasks: []tbapi.ChecklistTask{{Text: "task"}}}},
+			expected: "title\ntask",
+		},
+		{
+			name: "checklist, locator fallback", locatorHit: false,
+			msg:      tbapi.Message{Checklist: &tbapi.Checklist{Title: "title", Tasks: []tbapi.ChecklistTask{{Text: "task"}}}},
+			expected: "title\ntask",
+		},
+		{
+			name: "caption-only photo, locator hit", locatorHit: true,
+			msg:      tbapi.Message{Photo: []tbapi.PhotoSize{{FileID: "1"}}, Caption: "spam caption"},
+			expected: "spam caption",
+		},
+		{
+			name: "caption-only photo, locator fallback", locatorHit: false,
+			msg:      tbapi.Message{Photo: []tbapi.PhotoSize{{FileID: "1"}}, Caption: "spam caption"},
+			expected: "spam caption",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockAPI := &mocks.TbAPIMock{
+				RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) { return &tbapi.APIResponse{Ok: true}, nil },
+				SendFunc:    func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{Text: "test"}, nil },
+			}
+			botMock := &mocks.BotMock{
+				RemoveApprovedUserFunc: func(id int64) error { return nil },
+				OnMessageFunc:          func(msg bot.Message, checkOnly bool) bot.Response { return bot.Response{} },
+				UpdateSpamFunc:         func(msg string) error { return nil },
+			}
+			locatorMock := &mocks.LocatorMock{
+				MessageFunc: func(ctx context.Context, msg string) (storage.MsgMeta, bool) {
+					return storage.MsgMeta{UserID: 888, UserName: "spammer", MsgID: 999}, tt.locatorHit
+				},
+				SpamFunc: func(ctx context.Context, userID int64) (storage.SpamData, bool) { return storage.SpamData{}, true },
+			}
+			adminHandler := admin{tbAPI: mockAPI, bot: botMock, locator: locatorMock, primChatID: 123, adminChatID: 456}
+
+			msg := tt.msg
+			msg.MessageID, msg.Chat, msg.From = 789, tbapi.Chat{ID: 456}, &tbapi.User{UserName: "admin", ID: 123}
+			msg.ForwardOrigin = &tbapi.MessageOrigin{Type: "user", SenderUser: &tbapi.User{ID: 555, UserName: "spammer"}}
+
+			require.NoError(t, adminHandler.MsgHandler(tbapi.Update{Message: &msg}))
+			require.Len(t, botMock.OnMessageCalls(), 1)
+			assert.Equal(t, tt.expected, botMock.OnMessageCalls()[0].Msg.Text)
+			assert.True(t, botMock.OnMessageCalls()[0].CheckOnly)
+			require.Len(t, botMock.UpdateSpamCalls(), 1)
+			assert.Equal(t, tt.expected, botMock.UpdateSpamCalls()[0].Msg)
+		})
+	}
+}
+
 func TestAdmin_DirectSpamReport_ImageOnly(t *testing.T) {
 	mockAPI := &mocks.TbAPIMock{
 		SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) {
@@ -2858,6 +3084,23 @@ func TestAdmin_DirectReportWithAggressiveCleanup(t *testing.T) {
 		// verify GetUserMessageIDs was NOT called in dry mode
 		assert.Empty(t, locatorMock.GetUserMessageIDsCalls())
 	})
+
+	t.Run("aggressive cleanup skips linked channel post", func(t *testing.T) {
+		_, locatorMock, adm := setupAggressiveCleanupTest(true, false, []int{100, 101, 102})
+		adm.linkedChannelID = -1001234567890
+		update := createSpamReportUpdate()
+		update.Message.ReplyToMessage.From = &tbapi.User{ID: 136817688, UserName: "Channel_Bot"}
+		update.Message.ReplyToMessage.SenderChat = &tbapi.Chat{ID: -1001234567890, UserName: "linked_channel", Type: "channel"}
+
+		err := adm.directReport(update, true)
+		require.NoError(t, err)
+
+		// wait for a cleanup goroutine, if one was started
+		time.Sleep(200 * time.Millisecond)
+
+		// deleting every message of the linked channel would wipe the channel posts from the discussion group
+		assert.Empty(t, locatorMock.GetUserMessageIDsCalls())
+	})
 }
 
 func TestAdmin_DeleteUserMessages(t *testing.T) {
@@ -2998,6 +3241,27 @@ func TestAdmin_DeleteUserMessages(t *testing.T) {
 	})
 }
 
+func TestAdmin_isOwnChatSender(t *testing.T) {
+	tests := []struct {
+		name            string
+		linkedChannelID int64
+		senderChatID    int64
+		want            bool
+	}{
+		{name: "group itself", linkedChannelID: -1001234567890, senderChatID: 123, want: true},
+		{name: "linked channel", linkedChannelID: -1001234567890, senderChatID: -1001234567890, want: true},
+		{name: "other channel", linkedChannelID: -1001234567890, senderChatID: -1009999999999, want: false},
+		{name: "other channel, no linked channel", linkedChannelID: 0, senderChatID: -1009999999999, want: false},
+		{name: "no sender chat, no linked channel", linkedChannelID: 0, senderChatID: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adm := &admin{primChatID: 123, linkedChannelID: tt.linkedChannelID}
+			assert.Equal(t, tt.want, adm.isOwnChatSender(tt.senderChatID))
+		})
+	}
+}
+
 func TestAdmin_channelDisplayName(t *testing.T) {
 	adm := &admin{}
 
@@ -3017,4 +3281,98 @@ func TestAdmin_channelDisplayName(t *testing.T) {
 			assert.Equal(t, tt.expected, adm.channelDisplayName(tt.chat))
 		})
 	}
+}
+
+func TestAdmin_ReportUserBan(t *testing.T) {
+	user := bot.User{ID: 42, Username: "spammer"}
+	link := "[@spammer (42)](tg://user?id=42)"
+	tests := []struct {
+		name     string
+		training bool
+		dry      bool
+		softBan  bool
+		user     *bot.User
+		cause    string
+		want     string
+	}{
+		{name: "reaction", cause: "reaction spammer",
+			want: "**permanently banned " + link + " reaction spammer**\n\n"},
+		{name: "join", cause: "on join by lua-names, lua-premium",
+			want: "**permanently banned " + link + " on join by lua-names, lua-premium**\n\n"},
+		{name: "join escapes cause", cause: "on join by lua-bad_names",
+			want: "**permanently banned " + link + " on join by lua-bad\\_names**\n\n"},
+		{name: "training", training: true, softBan: true, cause: "on join by lua-names",
+			want: "**[training] would have permanently banned " + link + " on join by lua-names**\n\n"},
+		{name: "dry", dry: true, softBan: true, cause: "reaction spammer",
+			want: "**[dry run] would have permanently banned " + link + " reaction spammer**\n\n"},
+		{name: "soft-ban join", softBan: true, cause: "on join by lua-names",
+			want: "**restricted " + link + " on join by lua-names**\n\n"},
+		{name: "soft-ban reaction", softBan: true, cause: "reaction spammer",
+			want: "**restricted " + link + " reaction spammer**\n\n"},
+		{name: "display name with closing bracket", user: &bot.User{ID: 7, DisplayName: "Shop] 24/7"}, cause: "on join by lua-names",
+			want: "**permanently banned [Shop 24/7 (7)](tg://user?id=7) on join by lua-names**\n\n"},
+		{name: "link injection in display name", user: &bot.User{ID: 7, DisplayName: "Admin](https://scam.example)"},
+			cause: "on join by lua-names",
+			want:  "**permanently banned [Admin(https://scam.example) (7)](tg://user?id=7) on join by lua-names**\n\n"},
+		{name: "username with underscore not escaped in label", user: &bot.User{ID: 8, Username: "spam_bot"},
+			cause: "reaction spammer", want: "**permanently banned [@spam_bot (8)](tg://user?id=8) reaction spammer**\n\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			user := user
+			if tc.user != nil {
+				user = *tc.user
+			}
+			mockAPI := &mocks.TbAPIMock{SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{}, nil }}
+			adm := &admin{tbAPI: mockAPI, adminChatID: 999, primChatID: 123, trainingMode: tc.training, dry: tc.dry,
+				softBan: tc.softBan}
+
+			adm.ReportUserBan(user.String(), user, tc.cause)
+
+			require.Len(t, mockAPI.SendCalls(), 1)
+			sent, ok := mockAPI.SendCalls()[0].C.(tbapi.MessageConfig)
+			require.True(t, ok)
+			assert.Equal(t, int64(999), sent.ChatID)
+			assert.Equal(t, tc.want, sent.Text)
+
+			markup, ok := sent.ReplyMarkup.(tbapi.InlineKeyboardMarkup)
+			require.True(t, ok)
+			require.Len(t, markup.InlineKeyboard, 1)
+			require.Len(t, markup.InlineKeyboard[0], 2)
+			assert.Equal(t, fmt.Sprintf("?%d:0", user.ID), *markup.InlineKeyboard[0][0].CallbackData)
+			assert.Equal(t, fmt.Sprintf("!%d:0", user.ID), *markup.InlineKeyboard[0][1].CallbackData)
+		})
+	}
+}
+
+func TestAdmin_UnbanJoinNotification(t *testing.T) {
+	mockAPI := &mocks.TbAPIMock{
+		SendFunc:    func(c tbapi.Chattable) (tbapi.Message, error) { return tbapi.Message{}, nil },
+		RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) { return &tbapi.APIResponse{Ok: true}, nil },
+	}
+	botMock := &mocks.BotMock{
+		UpdateHamFunc:       func(msg string) error { return nil },
+		AddApprovedUserFunc: func(id int64, name string) error { return nil },
+	}
+	locatorMock := &mocks.LocatorMock{
+		SpamFunc: func(ctx context.Context, userID int64) (storage.SpamData, bool) { return storage.SpamData{}, false },
+	}
+	adm := &admin{tbAPI: mockAPI, bot: botMock, locator: locatorMock, primChatID: 123, adminChatID: 456, softBan: true}
+
+	// rendered (markdown-stripped) soft-ban join notification as telegram returns it on callback
+	query := &tbapi.CallbackQuery{
+		ID:   "cb",
+		Data: "42:0",
+		Message: &tbapi.Message{MessageID: 789, Chat: tbapi.Chat{ID: 456},
+			Text: "restricted @spammer (42) on join by lua-names", From: &tbapi.User{UserName: "bot"}},
+		From: &tbapi.User{UserName: "admin", ID: 111},
+	}
+
+	require.NoError(t, adm.callbackUnbanConfirmed(query))
+
+	assert.Empty(t, botMock.UpdateHamCalls(), "join notification text must not become a ham sample")
+	require.Len(t, botMock.AddApprovedUserCalls(), 1)
+	assert.Equal(t, int64(42), botMock.AddApprovedUserCalls()[0].ID)
+	assert.Equal(t, "@spammer", botMock.AddApprovedUserCalls()[0].Name)
 }

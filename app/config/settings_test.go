@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -118,6 +119,7 @@ func TestSettings_IsMetaEnabled(t *testing.T) {
 		linksOnly      bool
 		mentionOnly    bool
 		videosOnly     bool
+		documentsOnly  bool
 		audiosOnly     bool
 		forward        bool
 		keyboard       bool
@@ -134,6 +136,7 @@ func TestSettings_IsMetaEnabled(t *testing.T) {
 		{name: "linksOnly enabled", linksLimit: -1, mentionsLimit: -1, linksOnly: true, expected: true},
 		{name: "mentionOnly enabled", linksLimit: -1, mentionsLimit: -1, mentionOnly: true, expected: true},
 		{name: "videosOnly enabled", linksLimit: -1, mentionsLimit: -1, videosOnly: true, expected: true},
+		{name: "documentsOnly enabled", linksLimit: -1, mentionsLimit: -1, documentsOnly: true, expected: true},
 		{name: "audiosOnly enabled", linksLimit: -1, mentionsLimit: -1, audiosOnly: true, expected: true},
 		{name: "forward enabled", linksLimit: -1, mentionsLimit: -1, forward: true, expected: true},
 		{name: "keyboard enabled", linksLimit: -1, mentionsLimit: -1, keyboard: true, expected: true},
@@ -153,6 +156,7 @@ func TestSettings_IsMetaEnabled(t *testing.T) {
 			s.Meta.LinksOnly = tt.linksOnly
 			s.Meta.MentionOnly = tt.mentionOnly
 			s.Meta.VideosOnly = tt.videosOnly
+			s.Meta.DocumentsOnly = tt.documentsOnly
 			s.Meta.AudiosOnly = tt.audiosOnly
 			s.Meta.Forward = tt.forward
 			s.Meta.Keyboard = tt.keyboard
@@ -202,6 +206,7 @@ func newPopulatedSettings() *Settings {
 	s.Meta.ContactOnly = true
 	s.Meta.Giveaway = true
 	s.Meta.ExternalReply = true
+	s.Meta.DocumentsOnly = true
 
 	s.Gemini.Token = "gemini-secret"
 	s.Gemini.Veto = true
@@ -257,6 +262,7 @@ func TestSettings_JSONRoundTrip_NewGroups(t *testing.T) {
 	assert.Contains(t, jsonStr, `"contact_only"`)
 	assert.Contains(t, jsonStr, `"giveaway"`)
 	assert.Contains(t, jsonStr, `"external_reply"`)
+	assert.Contains(t, jsonStr, `"documents_only"`)
 
 	var restored Settings
 	require.NoError(t, json.Unmarshal(data, &restored))
@@ -273,6 +279,7 @@ func TestSettings_JSONRoundTrip_NewGroups(t *testing.T) {
 	assert.True(t, restored.Meta.ContactOnly)
 	assert.True(t, restored.Meta.Giveaway)
 	assert.True(t, restored.Meta.ExternalReply)
+	assert.True(t, restored.Meta.DocumentsOnly)
 }
 
 func TestSettings_YAMLRoundTrip_NewGroups(t *testing.T) {
@@ -294,6 +301,7 @@ func TestSettings_YAMLRoundTrip_NewGroups(t *testing.T) {
 	assert.Contains(t, yamlStr, "contact_only:")
 	assert.Contains(t, yamlStr, "giveaway:")
 	assert.Contains(t, yamlStr, "external_reply:")
+	assert.Contains(t, yamlStr, "documents_only:")
 
 	var restored Settings
 	require.NoError(t, yaml.Unmarshal(data, &restored))
@@ -310,6 +318,7 @@ func TestSettings_YAMLRoundTrip_NewGroups(t *testing.T) {
 	assert.True(t, restored.Meta.ContactOnly)
 	assert.True(t, restored.Meta.Giveaway)
 	assert.True(t, restored.Meta.ExternalReply)
+	assert.True(t, restored.Meta.DocumentsOnly)
 }
 
 func TestSettings_ApplyDefaults_FillsZeroFromTemplate(t *testing.T) {
@@ -748,13 +757,33 @@ func TestSettings_Validate(t *testing.T) {
 			s:       &Settings{MaxShortMsgCount: 3, ParanoidMode: true},
 			wantErr: "max-short-msg-count is incompatible with paranoid mode",
 		},
-		{name: "max-short-msg-count positive with default first-message-only mode is valid", s: &Settings{MaxShortMsgCount: 3}, wantErr: ""},
+		{
+			name:    "max-short-msg-count positive with default first-message-only mode is valid",
+			s:       &Settings{MaxShortMsgCount: 3, MinMsgLen: 50},
+			wantErr: "",
+		},
+		{
+			name:    "max-short-msg-count positive with min-msg-len zero is rejected",
+			s:       &Settings{MaxShortMsgCount: 3, MinMsgLen: 0},
+			wantErr: "max-short-msg-count requires min-msg-len > 1 (got 0)",
+		},
+		{
+			name:    "max-short-msg-count positive with min-msg-len one is rejected",
+			s:       &Settings{MaxShortMsgCount: 3, MinMsgLen: 1},
+			wantErr: "max-short-msg-count requires min-msg-len > 1 (got 1)",
+		},
+		{name: "max-short-msg-count positive with min-msg-len two is valid", s: &Settings{MaxShortMsgCount: 3, MinMsgLen: 2}, wantErr: ""},
+		{name: "max-short-msg-count zero with min-msg-len zero is valid", s: &Settings{MaxShortMsgCount: 0, MinMsgLen: 0}, wantErr: ""},
 		{
 			name:    "max-short-msg-count positive with paranoid mode and first-messages-count is rejected",
 			s:       &Settings{MaxShortMsgCount: 3, ParanoidMode: true, FirstMessagesCount: 2},
 			wantErr: "max-short-msg-count is incompatible with paranoid mode",
 		},
-		{name: "max-short-msg-count positive with first-messages-count is valid", s: &Settings{MaxShortMsgCount: 3, FirstMessagesCount: 2}, wantErr: ""},
+		{
+			name:    "max-short-msg-count positive with first-messages-count is valid",
+			s:       &Settings{MaxShortMsgCount: 3, FirstMessagesCount: 2, MinMsgLen: 50},
+			wantErr: "",
+		},
 		{name: "prohibited-langs empty is valid (disabled)", s: &Settings{ProhibitedLangs: ""}, wantErr: ""},
 		{name: "prohibited-langs alias accepted", s: &Settings{ProhibitedLangs: "chinese", ProhibitedLangsMin: 3}, wantErr: ""},
 		{name: "prohibited-langs raw script name accepted", s: &Settings{ProhibitedLangs: "Cyrillic", ProhibitedLangsMin: 3}, wantErr: ""},
@@ -785,4 +814,135 @@ func TestSettings_Validate(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+func TestSettings_ValidateJev(t *testing.T) {
+	valid := func() *Settings {
+		s := &Settings{}
+		s.Jev.Token = "t"
+		s.Jev.Question = "Is `message` spam?"
+		s.Jev.CriteriaSpam = "promotes"
+		s.Jev.CriteriaHam = "conversation"
+		s.Jev.Threshold = 0.3
+		return s
+	}
+
+	t.Run("valid config passes", func(t *testing.T) {
+		require.NoError(t, valid().Validate())
+	})
+
+	t.Run("disabled jev skips validation entirely", func(t *testing.T) {
+		s := valid()
+		s.Jev.Token = ""
+		s.Jev.Threshold = 0
+		s.Jev.Question = ""
+		require.NoError(t, s.Validate())
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Settings)
+		errMsg string
+	}{
+		{"zero threshold", func(s *Settings) { s.Jev.Threshold = 0 }, "(0, 1]"},
+		{"threshold above one", func(s *Settings) { s.Jev.Threshold = 1.5 }, "(0, 1]"},
+		{"negative threshold", func(s *Settings) { s.Jev.Threshold = -0.1 }, "(0, 1]"},
+		{"NaN threshold", func(s *Settings) { s.Jev.Threshold = math.NaN() }, "finite"},
+		{"inf threshold", func(s *Settings) { s.Jev.Threshold = math.Inf(1) }, "finite"},
+		{"negative max symbols", func(s *Settings) { s.Jev.MaxSymbolsRequest = -1 }, "max-symbols-request"},
+		{"empty question", func(s *Settings) { s.Jev.Question = "" }, "question"},
+		{"empty spam criteria", func(s *Settings) { s.Jev.CriteriaSpam = "" }, "criteria-spam"},
+		{"empty ham criteria", func(s *Settings) { s.Jev.CriteriaHam = "" }, "criteria-ham"},
+		{"NaN gibberish threshold", func(s *Settings) { s.Jev.GibberishThreshold = math.NaN() }, "jev.gibberish-threshold"},
+		{"inf gibberish threshold", func(s *Settings) { s.Jev.GibberishThreshold = math.Inf(1) }, "jev.gibberish-threshold"},
+		{"negative gibberish threshold", func(s *Settings) { s.Jev.GibberishThreshold = -0.1 }, "[0, 1]"},
+		{"gibberish threshold above one", func(s *Settings) { s.Jev.GibberishThreshold = 1.1 }, "[0, 1]"},
+		{"gibberish threshold with history", func(s *Settings) { s.Jev.GibberishThreshold, s.Jev.HistorySize = 0.5, 3 }, "history-size"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := valid()
+			tt.mutate(s)
+			err := s.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+
+	t.Run("gibberish threshold without history passes", func(t *testing.T) {
+		s := valid()
+		s.Jev.GibberishThreshold = 0.5
+		require.NoError(t, s.Validate())
+	})
+
+	t.Run("history without gibberish threshold passes", func(t *testing.T) {
+		s := valid()
+		s.Jev.HistorySize = 3
+		require.NoError(t, s.Validate())
+	})
+}
+
+func TestSettings_JevGibberishThresholdZeroSurvivesMerge(t *testing.T) {
+	stored := &Settings{}
+	stored.Jev.Token = "t"
+
+	template := &Settings{}
+	template.Jev.GibberishThreshold = 0.5
+
+	stored.ApplyDefaults(template)
+	assert.Zero(t, stored.Jev.GibberishThreshold, "zero gibberish threshold means disabled and must survive the merge")
+}
+
+func TestSettings_IsJevEnabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		apiBase string
+		want    bool
+	}{
+		{"token set", "t", "", true},
+		{"nothing set", "", "", false},
+		{"apibase alone does not enable", "", "https://proxy.example/v1", false},
+		{"token and apibase", "t", "https://proxy.example/v1", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Settings{}
+			s.Jev.Token, s.Jev.APIBase = tt.token, tt.apiBase
+			assert.Equal(t, tt.want, s.IsJevEnabled())
+		})
+	}
+}
+
+func TestSettings_JevHistorySizeZeroSurvivesMerge(t *testing.T) {
+	stored := &Settings{}
+	stored.Jev.HistorySize = 0
+	stored.Jev.Token = "t"
+
+	template := &Settings{}
+	template.Jev.HistorySize = 10
+
+	stored.ApplyDefaults(template)
+	assert.Equal(t, 0, stored.Jev.HistorySize, "zero history size means disabled and must survive the merge")
+}
+
+// pins the legacy-DB case: settings stored before these fields existed arrive zero-valued
+// and must pick up the template defaults rather than failing validation
+func TestSettings_JevLegacyStoredSettingsTakeTemplateDefaults(t *testing.T) {
+	legacy := &Settings{}
+	legacy.Jev.Token = "t"
+
+	template := &Settings{}
+	template.Jev.Question = "Is `message` spam?"
+	template.Jev.CriteriaSpam = "promotes"
+	template.Jev.CriteriaHam = "conversation"
+	template.Jev.Threshold = 0.3
+	template.Jev.MaxSymbolsRequest = 6000
+	template.Jev.Model = "jev-1.13.0"
+
+	legacy.ApplyDefaults(template)
+	assert.Equal(t, "Is `message` spam?", legacy.Jev.Question)
+	assert.Equal(t, "jev-1.13.0", legacy.Jev.Model)
+	assert.InDelta(t, 0.3, legacy.Jev.Threshold, 0.0001)
+	require.NoError(t, legacy.Validate())
 }

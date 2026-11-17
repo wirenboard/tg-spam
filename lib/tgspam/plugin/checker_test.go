@@ -1,12 +1,19 @@
 package plugin
 
 import (
+	"bytes"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	lua "github.com/yuin/gopher-lua"
 
 	"github.com/umputun/tg-spam/lib/spamcheck"
 )
@@ -95,7 +102,7 @@ func TestChecker_MetaFields(t *testing.T) {
 	scriptPath := filepath.Join(tmpDir, "meta_fields.lua")
 	err := os.WriteFile(scriptPath, []byte(`
 		function check(req)
-			if req.meta.has_contact and req.meta.message_id == 42 and req.meta.has_giveaway and req.meta.has_external_reply then
+			if req.meta.has_contact and req.meta.message_id == 42 and req.meta.has_giveaway and req.meta.has_external_reply and req.meta.has_document then
 				return true, "meta matched"
 			end
 			return false, "not matched"
@@ -114,7 +121,7 @@ func TestChecker_MetaFields(t *testing.T) {
 	t.Run("all meta fields set", func(t *testing.T) {
 		resp := checkFunc(spamcheck.Request{
 			Msg: "test", UserID: "1", UserName: "user",
-			Meta: spamcheck.MetaData{HasContact: true, MessageID: 42, HasGiveaway: true, HasExternalReply: true},
+			Meta: spamcheck.MetaData{HasContact: true, MessageID: 42, HasGiveaway: true, HasExternalReply: true, HasDocument: true},
 		})
 		assert.True(t, resp.Spam)
 		assert.Equal(t, "meta matched", resp.Details)
@@ -380,4 +387,782 @@ end
 
 	// wait for the goroutine to finish
 	<-done
+}
+
+func TestChecker_ConcurrentChecks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// the script echoes the user id back so a corrupted stack shows up as a mismatched result
+	// rather than only as a race detector report
+	scriptPath := filepath.Join(tmpDir, "parallel_test.lua")
+	err := os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return request.user_id == "spammer", "seen " .. request.user_id
+end
+	`), 0o644)
+	require.NoError(t, err)
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(scriptPath))
+
+	check, err := checker.GetCheck("parallel_test")
+	require.NoError(t, err)
+
+	// every goroutine drives the same shared lua state; without the write lock in
+	// the closure returned by createResultCheck, this fails under -race or panics inside gopher-lua
+	const workers, iterations = 8, 50
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Go(func() {
+			userID := fmt.Sprintf("user%d", i)
+			if i == 0 {
+				userID = "spammer"
+			}
+			for range iterations {
+				resp := check(spamcheck.Request{Msg: "test message", UserID: userID})
+				assert.Equal(t, "lua-parallel_test", resp.Name)
+				assert.Equal(t, "seen "+userID, resp.Details)
+				assert.Equal(t, userID == "spammer", resp.Spam)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func TestChecker_ReloadReachesAlreadyObtainedCheck(t *testing.T) {
+	// the detector keeps a Check for its lifetime, so refreshing only the registry leaves it on the old script
+	tmpDir := t.TempDir()
+
+	scriptPath := filepath.Join(tmpDir, "held_test.lua")
+	err := os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return true, "original version"
+end
+	`), 0o644)
+	require.NoError(t, err)
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(scriptPath))
+
+	held, err := checker.GetCheck("held_test")
+	require.NoError(t, err)
+	resp := held(createTestRequest())
+	require.Equal(t, "original version", resp.Details)
+
+	err = os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return false, "reloaded version"
+end
+	`), 0o644)
+	require.NoError(t, err)
+	require.NoError(t, checker.ReloadScript(scriptPath))
+
+	resp = held(createTestRequest())
+	assert.Equal(t, "reloaded version", resp.Details, "check obtained before the reload must run the new script")
+	assert.False(t, resp.Spam)
+}
+
+func TestChecker_ReloadReachesHeldResultChecks(t *testing.T) {
+	// Detector stores ResultCheck values for its lifetime, so a captured function would pin both
+	// the details and the approval bit to the version loaded first
+	tmpDir := t.TempDir()
+
+	scriptPath := filepath.Join(tmpDir, "held_result.lua")
+	err := os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return false, "original version", false
+end
+	`), 0o644)
+	require.NoError(t, err)
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(scriptPath))
+
+	held, err := checker.GetResultCheck("held_result")
+	require.NoError(t, err)
+	heldAll := checker.GetAllResultChecks()["held_result"]
+	require.NotNil(t, heldAll)
+
+	res := held(createTestRequest())
+	require.Equal(t, "original version", res.Response.Details)
+	require.False(t, res.Approved)
+
+	err = os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return false, "reloaded version", true
+end
+	`), 0o644)
+	require.NoError(t, err)
+	require.NoError(t, checker.ReloadScript(scriptPath))
+
+	for name, check := range map[string]ResultCheck{"GetResultCheck": held, "GetAllResultChecks": heldAll} {
+		res = check(createTestRequest())
+		assert.Equal(t, "reloaded version", res.Response.Details, "%s must run the new script", name)
+		assert.True(t, res.Approved, "%s must see the new approval", name)
+	}
+}
+
+func TestChecker_FailedReloadKeepsRegistryEntry(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	scriptPath := filepath.Join(tmpDir, "broken_test.lua")
+	err := os.WriteFile(scriptPath, []byte(`
+function check(request)
+	return true, "original version"
+end
+	`), 0o644)
+	require.NoError(t, err)
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(scriptPath))
+	held, err := checker.GetCheck("broken_test")
+	require.NoError(t, err)
+
+	err = os.WriteFile(scriptPath, []byte(`function check(request) this is not lua`), 0o644)
+	require.NoError(t, err)
+	require.Error(t, checker.ReloadScript(scriptPath))
+
+	// a broken edit must not deregister a script that is still being executed
+	assert.Contains(t, checker.GetAllChecks(), "broken_test", "plugin stays registered after a failed reload")
+	_, err = checker.GetCheck("broken_test")
+	require.NoError(t, err)
+
+	resp := held(createTestRequest())
+	assert.Equal(t, "original version", resp.Details)
+	assert.True(t, resp.Spam)
+}
+
+func TestChecker_FailedReloadCanStillMutateSharedGlobals(t *testing.T) {
+	// keeping the old entry does not make a failed reload a no-op: the candidate runs in the shared VM
+	tmpDir := t.TempDir()
+
+	scriptPath := filepath.Join(tmpDir, "partial_test.lua")
+	err := os.WriteFile(scriptPath, []byte(`
+GREETING = "original version"
+MAIN_VM = true
+function check(request)
+	return true, GREETING
+end
+	`), 0o644)
+	require.NoError(t, err)
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(scriptPath))
+	held, err := checker.GetCheck("partial_test")
+	require.NoError(t, err)
+	require.Equal(t, "original version", held(createTestRequest()).Details)
+
+	// MAIN_VM exists only in the shared VM, so this validates in the throwaway state and fails after reassigning GREETING
+	err = os.WriteFile(scriptPath, []byte(`
+GREETING = "mutated before failure"
+if MAIN_VM then error("boom") end
+function check(request)
+	return true, GREETING
+end
+	`), 0o644)
+	require.NoError(t, err)
+	require.Error(t, checker.ReloadScript(scriptPath))
+
+	assert.Contains(t, checker.GetAllChecks(), "partial_test", "the entry survives the failed reload")
+	assert.Equal(t, "mutated before failure", held(createTestRequest()).Details, "but its behavior does not")
+}
+
+func TestChecker_ResultCheck(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		wantSpam     bool
+		wantApproved bool
+		wantError    bool
+	}{
+		{name: "absent approval remains compatible", body: `return false, "clean"`},
+		{name: "explicit false does not approve", body: `return false, "clean", false`},
+		{name: "exact true approves ham", body: `return false, "trusted message", true`, wantApproved: true},
+		{name: "true cannot approve spam", body: `return true, "spam", true`, wantSpam: true},
+		{name: "string is not an approval", body: `return false, "clean", "false"`},
+		{name: "runtime error does not approve", body: `local value = request.missing.value; return false, value, true`, wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checker := NewChecker()
+			defer checker.Close()
+
+			scriptPath := filepath.Join(t.TempDir(), "result.lua")
+			script := "function check(request)\n" + tt.body + "\nend\n"
+			require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o600))
+			require.NoError(t, checker.LoadScript(scriptPath))
+
+			check, err := checker.GetResultCheck("result")
+			require.NoError(t, err)
+			result := check(spamcheck.Request{Msg: "test"})
+
+			assert.Equal(t, tt.wantSpam, result.Response.Spam)
+			assert.Equal(t, tt.wantApproved, result.Approved)
+			assert.Equal(t, "lua-result", result.Response.Name)
+			if tt.wantError {
+				assert.Error(t, result.Response.Error)
+			} else {
+				assert.NoError(t, result.Response.Error)
+			}
+		})
+	}
+}
+
+func TestChecker_ResultCheckWarnings(t *testing.T) {
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	checker := NewChecker()
+	defer checker.Close()
+	scriptPath := filepath.Join(t.TempDir(), "types.lua")
+	script := `
+function check(request)
+    if request.msg == "false" then
+        return false, "clean", false
+    end
+    if request.msg == "nil" then
+        return false, "clean"
+    end
+    if request.msg == "string" then
+        return false, "clean", "false"
+    end
+    if request.msg == "number" then
+        return false, "clean", 1
+    end
+    return true, "spam", true
+end
+`
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o600))
+	require.NoError(t, checker.LoadScript(scriptPath))
+	check, err := checker.GetResultCheck("types")
+	require.NoError(t, err)
+
+	for range 2 {
+		assert.False(t, check(spamcheck.Request{Msg: "false"}).Approved)
+		assert.False(t, check(spamcheck.Request{Msg: "nil"}).Approved)
+		assert.False(t, check(spamcheck.Request{Msg: "string"}).Approved)
+		assert.False(t, check(spamcheck.Request{Msg: "number"}).Approved)
+		assert.False(t, check(spamcheck.Request{Msg: "conflict"}).Approved)
+	}
+
+	output := logs.String()
+	assert.Equal(t, 1, strings.Count(output, `lua checker "types" returned approval value with type string`))
+	assert.Equal(t, 1, strings.Count(output, `lua checker "types" returned approval value with type number`))
+	assert.Equal(t, 1, strings.Count(output, `lua checker "types" returned approval=true with spam=true`))
+	assert.NotContains(t, output, `approval value "false"`)
+	assert.Len(t, strings.Split(strings.TrimSpace(output), "\n"), 3)
+}
+
+func TestChecker_ResultAdapters(t *testing.T) {
+	checker := NewChecker()
+	defer checker.Close()
+	scriptPath := filepath.Join(t.TempDir(), "adapter.lua")
+	require.NoError(t, os.WriteFile(scriptPath, []byte(`
+function check(request)
+    return false, "approved", true
+end
+`), 0o600))
+	require.NoError(t, checker.LoadScript(scriptPath))
+
+	legacyCheck, err := checker.GetCheck("adapter")
+	require.NoError(t, err)
+	assert.Equal(t, spamcheck.Response{Name: "lua-adapter", Details: "approved"}, legacyCheck(spamcheck.Request{}))
+
+	resultChecks := checker.GetAllResultChecks()
+	require.Contains(t, resultChecks, "adapter")
+	assert.True(t, resultChecks["adapter"](spamcheck.Request{}).Approved)
+}
+
+func TestChecker_JoinCheck(t *testing.T) {
+	writeScript := func(t *testing.T, path, body string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	}
+	joinReq := spamcheck.Request{UserID: "42", UserName: "spammer", FirstName: "Green", LastName: "Shop", IsPremium: true}
+
+	t.Run("script with check_join", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "names.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, "message ok"
+end
+function check_join(req)
+	if req.user_id == "42" and req.user_name == "spammer" and req.first_name == "Green" and
+		req.last_name == "Shop" and req.is_premium then
+		return true, "bad name"
+	end
+	return false, "fields not passed"
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+
+		joinCheck, err := checker.GetJoinCheck("names")
+		require.NoError(t, err)
+		resp, ok := joinCheck(joinReq)
+		assert.True(t, ok)
+		assert.Equal(t, spamcheck.Response{Name: "lua-names", Spam: true, Details: "bad name"}, resp)
+
+		msgCheck, err := checker.GetCheck("names")
+		require.NoError(t, err)
+		assert.Equal(t, spamcheck.Response{Name: "lua-names", Details: "message ok"}, msgCheck(createTestRequest()))
+	})
+
+	t.Run("request has no msg and no meta", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "fields.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return false, tostring(req.msg) .. "," .. tostring(req.meta)
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+		joinCheck, err := checker.GetJoinCheck("fields")
+		require.NoError(t, err)
+		resp, ok := joinCheck(joinReq)
+		assert.True(t, ok)
+		assert.Equal(t, "nil,nil", resp.Details)
+	})
+
+	t.Run("third return value ignored", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "third.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "d", true
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+		joinCheck, err := checker.GetJoinCheck("third")
+		require.NoError(t, err)
+		resp, ok := joinCheck(joinReq)
+		assert.True(t, ok)
+		assert.Equal(t, spamcheck.Response{Name: "lua-third", Spam: true, Details: "d"}, resp)
+	})
+
+	t.Run("script without check_join", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "plain.lua")
+		writeScript(t, path, `
+function check(req)
+	return true, "spam"
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+		joinCheck, err := checker.GetJoinCheck("plain")
+		require.NoError(t, err)
+		resp, ok := joinCheck(joinReq)
+		assert.False(t, ok)
+		assert.Equal(t, spamcheck.Response{}, resp)
+	})
+
+	t.Run("non-function check_join ignored", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "table.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+check_join = {}
+`)
+		require.NoError(t, checker.LoadScript(path))
+		joinCheck, err := checker.GetJoinCheck("table")
+		require.NoError(t, err)
+		_, ok := joinCheck(joinReq)
+		assert.False(t, ok)
+	})
+
+	t.Run("script without check_join does not inherit one from the shared VM", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		dir := t.TempDir()
+		writeScript(t, filepath.Join(dir, "a.lua"), `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "from a"
+end
+`)
+		writeScript(t, filepath.Join(dir, "b.lua"), `
+function check(req)
+	return false, ""
+end
+`)
+		require.NoError(t, checker.LoadDirectory(dir))
+
+		aCheck, err := checker.GetJoinCheck("a")
+		require.NoError(t, err)
+		bCheck, err := checker.GetJoinCheck("b")
+		require.NoError(t, err)
+
+		_, ok := bCheck(joinReq)
+		assert.False(t, ok, "b has no check_join of its own")
+		resp, ok := aCheck(joinReq)
+		assert.True(t, ok)
+		assert.Equal(t, "from a", resp.Details)
+	})
+
+	t.Run("each script calls its own check_join", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		dir := t.TempDir()
+		aPath, bPath := filepath.Join(dir, "a.lua"), filepath.Join(dir, "b.lua")
+		writeScript(t, aPath, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return false, "from a"
+end
+`)
+		writeScript(t, bPath, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "from b"
+end
+`)
+		require.NoError(t, checker.LoadScript(aPath))
+		require.NoError(t, checker.LoadScript(bPath))
+
+		aCheck, err := checker.GetJoinCheck("a")
+		require.NoError(t, err)
+		resp, _ := aCheck(joinReq)
+		assert.Equal(t, spamcheck.Response{Name: "lua-a", Details: "from a"}, resp)
+
+		writeScript(t, bPath, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "from b v2"
+end
+`)
+		require.NoError(t, checker.ReloadScript(bPath))
+		resp, _ = aCheck(joinReq)
+		assert.Equal(t, spamcheck.Response{Name: "lua-a", Details: "from a"}, resp)
+
+		bCheck, err := checker.GetJoinCheck("b")
+		require.NoError(t, err)
+		resp, _ = bCheck(joinReq)
+		assert.Equal(t, spamcheck.Response{Name: "lua-b", Spam: true, Details: "from b v2"}, resp)
+	})
+
+	t.Run("reload adds, replaces and removes check_join", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "reload.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+		held, err := checker.GetJoinCheck("reload")
+		require.NoError(t, err)
+		_, ok := held(joinReq)
+		assert.False(t, ok)
+
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "v1"
+end
+`)
+		require.NoError(t, checker.ReloadScript(path))
+		resp, ok := held(joinReq)
+		assert.True(t, ok, "added by reload")
+		assert.Equal(t, "v1", resp.Details)
+
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return false, "v2"
+end
+`)
+		require.NoError(t, checker.ReloadScript(path))
+		resp, ok = held(joinReq)
+		assert.True(t, ok, "replaced by reload")
+		assert.Equal(t, spamcheck.Response{Name: "lua-reload", Details: "v2"}, resp)
+
+		writeScript(t, path, `function check(req) this is not lua`)
+		require.Error(t, checker.ReloadScript(path))
+		resp, ok = held(joinReq)
+		assert.True(t, ok, "failed reload keeps the previous function")
+		assert.Equal(t, "v2", resp.Details)
+
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+`)
+		require.NoError(t, checker.ReloadScript(path))
+		_, ok = held(joinReq)
+		assert.False(t, ok, "removed by reload")
+	})
+
+	t.Run("lua error never bans", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		path := filepath.Join(t.TempDir(), "broken.lua")
+		writeScript(t, path, `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, req.missing.value
+end
+`)
+		require.NoError(t, checker.LoadScript(path))
+		joinCheck, err := checker.GetJoinCheck("broken")
+		require.NoError(t, err)
+		resp, ok := joinCheck(joinReq)
+		assert.True(t, ok)
+		assert.False(t, resp.Spam)
+		require.Error(t, resp.Error)
+		assert.Equal(t, "lua-broken", resp.Name)
+		assert.Contains(t, resp.Details, "error executing lua join checker")
+
+		// the VM stays usable after the error
+		resp, ok = joinCheck(joinReq)
+		assert.True(t, ok)
+		require.Error(t, resp.Error)
+	})
+
+	t.Run("unknown script and all join checks", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		dir := t.TempDir()
+		writeScript(t, filepath.Join(dir, "with.lua"), `
+function check(req)
+	return false, ""
+end
+function check_join(req)
+	return true, "with"
+end
+`)
+		writeScript(t, filepath.Join(dir, "without.lua"), `
+function check(req)
+	return false, ""
+end
+`)
+		require.NoError(t, checker.LoadDirectory(dir))
+
+		_, err := checker.GetJoinCheck("missing")
+		require.Error(t, err)
+
+		all := checker.GetAllJoinChecks()
+		require.Len(t, all, 2)
+		resp, ok := all["with"](joinReq)
+		assert.True(t, ok)
+		assert.Equal(t, "with", resp.Details)
+		_, ok = all["without"](joinReq)
+		assert.False(t, ok)
+	})
+}
+
+func TestChecker_Libraries(t *testing.T) {
+	probe := `
+function check(req)
+	local value = loadstring("return " .. req.msg)()
+	return value ~= nil, type(value)
+end
+`
+	loadProbe := func(t *testing.T, opts ...Option) Check {
+		t.Helper()
+		checker := NewChecker(opts...)
+		t.Cleanup(checker.Close)
+		path := filepath.Join(t.TempDir(), "probe.lua")
+		require.NoError(t, os.WriteFile(path, []byte(probe), 0o600))
+		require.NoError(t, checker.LoadScript(path))
+		check, err := checker.GetCheck("probe")
+		require.NoError(t, err)
+		return check
+	}
+	available := []string{"os.time", "os.date", "os.clock", "os.difftime", "string.upper", "table.insert",
+		"math.floor", "coroutine.create", "pairs", "loadstring", "http_request", "to_lower"}
+	removed := []string{"os.execute", "os.getenv", "os.setenv", "os.exit", "os.remove", "os.rename", "os.tmpname",
+		"os.setlocale", "io", "package", "debug", "channel", "dofile", "loadfile", "module", "require"}
+
+	t.Run("restricted by default", func(t *testing.T) {
+		check := loadProbe(t)
+		for _, name := range available {
+			resp := check(spamcheck.Request{Msg: name})
+			require.NoError(t, resp.Error, name)
+			assert.True(t, resp.Spam, name)
+		}
+		for _, name := range removed {
+			resp := check(spamcheck.Request{Msg: name})
+			require.NoError(t, resp.Error, name)
+			assert.False(t, resp.Spam, name)
+		}
+	})
+
+	t.Run("registered os table holds only the allowed functions", func(t *testing.T) {
+		checker := NewChecker()
+		defer checker.Close()
+		loaded := checker.vm.GetField(checker.vm.Get(lua.RegistryIndex), "_LOADED")
+		osTable, ok := checker.vm.GetField(loaded, lua.OsLibName).(*lua.LTable)
+		require.True(t, ok)
+		var names []string
+		osTable.ForEach(func(key, _ lua.LValue) { names = append(names, key.String()) })
+		assert.ElementsMatch(t, []string{"clock", "date", "difftime", "time"}, names)
+	})
+
+	t.Run("unrestricted on request", func(t *testing.T) {
+		check := loadProbe(t, WithUnrestrictedLibs())
+		for _, name := range append(available, "os.execute", "os.getenv", "io", "package", "debug", "dofile",
+			"loadfile", "module", "require") {
+			resp := check(spamcheck.Request{Msg: name})
+			require.NoError(t, resp.Error, name)
+			assert.True(t, resp.Spam, name)
+		}
+	})
+
+	t.Run("script loading also runs restricted", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "env.lua")
+		require.NoError(t, os.WriteFile(path, []byte(`
+local home = os.getenv("HOME")
+function check(req)
+	return false, ""
+end
+`), 0o600))
+		guarded := filepath.Join(dir, "guarded.lua")
+		require.NoError(t, os.WriteFile(guarded, []byte(`
+local home = os.getenv and os.getenv("HOME") or ""
+function check(req)
+	return false, home
+end
+`), 0o600))
+
+		checker := NewChecker()
+		defer checker.Close()
+		require.ErrorContains(t, checker.LoadScript(path), "failed to load Lua script")
+		require.NoError(t, checker.LoadScript(guarded))
+
+		unrestricted := NewChecker(WithUnrestrictedLibs())
+		defer unrestricted.Close()
+		require.NoError(t, unrestricted.LoadScript(path))
+	})
+
+	t.Run("no state used for loading has io", func(t *testing.T) {
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "marker")
+		path := filepath.Join(dir, "writer.lua")
+		require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`
+if io then
+	local f = io.open(%q, "w")
+	f:write("x")
+	f:close()
+end
+function check(req)
+	return false, ""
+end
+`, marker)), 0o600))
+
+		checker := NewChecker()
+		defer checker.Close()
+		require.NoError(t, checker.LoadScript(path))
+		assert.NoFileExists(t, marker)
+	})
+}
+
+func TestChecker_LoadDirectorySkipsBrokenScripts(t *testing.T) {
+	logs := captureLog(t)
+	dir := t.TempDir()
+	scripts := map[string]string{
+		"good.lua":    "function check(req)\n\treturn true, \"good\"\nend\n",
+		"syntax.lua":  "function check(req\n",
+		"env.lua":     "os.getenv(\"HOME\")\nfunction check(req)\n\treturn false, \"\"\nend\n",
+		"nocheck.lua": "local x = 1\n",
+	}
+	for name, body := range scripts {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	}
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadDirectory(dir))
+
+	assert.Equal(t, []string{"good"}, mapKeys(checker.GetAllChecks()))
+	for _, name := range []string{"syntax.lua", "env.lua", "nocheck.lua"} {
+		assert.Contains(t, logs.String(), "[WARN] skipped Lua script "+filepath.Join(dir, name), name)
+	}
+}
+
+func TestChecker_RuntimeErrorWarnsOnce(t *testing.T) {
+	logs := captureLog(t)
+	path := filepath.Join(t.TempDir(), "broken.lua")
+	require.NoError(t, os.WriteFile(path, []byte(`
+function check(req)
+	return os.getenv("HOME") ~= nil, ""
+end
+function check_join(req)
+	return io.open("/etc/passwd") ~= nil, ""
+end
+`), 0o600))
+
+	checker := NewChecker()
+	defer checker.Close()
+	require.NoError(t, checker.LoadScript(path))
+	check, err := checker.GetResultCheck("broken")
+	require.NoError(t, err)
+	joinCheck, err := checker.GetJoinCheck("broken")
+	require.NoError(t, err)
+
+	for range 3 {
+		res := check(spamcheck.Request{Msg: "hello"})
+		require.Error(t, res.Response.Error)
+		assert.False(t, res.Response.Spam)
+		resp, ok := joinCheck(spamcheck.Request{UserID: "1"})
+		assert.True(t, ok)
+		require.Error(t, resp.Error)
+		assert.False(t, resp.Spam)
+	}
+
+	assert.Equal(t, 1, strings.Count(logs.String(), `[WARN] lua checker "broken" failed`))
+	assert.Equal(t, 1, strings.Count(logs.String(), `[WARN] lua join checker "broken" failed`))
+}
+
+func mapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

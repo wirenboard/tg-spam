@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -151,6 +152,59 @@ func TestApplyCLIOverrides(t *testing.T) {
 		opts.Gemini.Token = "cli-gemini"
 		applyCLIOverrides(&settings, opts, defaults)
 		assert.Equal(t, "cli-gemini", settings.Gemini.Token, "CLI gemini token must override DB value")
+	})
+
+	t.Run("cas token CLI overrides DB value and is recorded", func(t *testing.T) {
+		settings := config.Settings{CAS: config.CASSettings{Token: "db-cas"}}
+		opts := newDefaultOpts(t)
+		opts.CAS.Token = "cli-cas"
+		applyCLIOverrides(&settings, opts, defaults)
+		assert.Equal(t, "cli-cas", settings.CAS.Token)
+		assert.Equal(t, []string{config.FieldCASToken}, settings.Transient.CredentialsFromCLI)
+	})
+
+	t.Run("empty cas token CLI keeps DB value", func(t *testing.T) {
+		settings := config.Settings{CAS: config.CASSettings{Token: "db-cas"}}
+		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)
+		assert.Equal(t, "db-cas", settings.CAS.Token)
+		assert.Empty(t, settings.Transient.CredentialsFromCLI)
+	})
+
+	t.Run("cli credentials are recorded, empty ones are not", func(t *testing.T) {
+		settings := config.Settings{OpenAI: config.OpenAISettings{Token: "db-openai"}}
+		opts := newDefaultOpts(t)
+		opts.Telegram.Token = "cli-telegram"
+		opts.Jev.Token = "cli-jev"
+		applyCLIOverrides(&settings, opts, defaults)
+		assert.Equal(t, []string{config.FieldTelegramToken, config.FieldJevToken}, settings.Transient.CredentialsFromCLI)
+		assert.Equal(t, "cli-jev", settings.Jev.Token)
+		assert.Equal(t, "db-openai", settings.OpenAI.Token)
+	})
+
+	t.Run("cli auth flags record the auth hash once", func(t *testing.T) {
+		settings := config.Settings{}
+		applyCLIOverrides(&settings, makeOpts(t, "cli-password", "cli-hash"), defaults)
+		assert.Equal(t, []string{config.FieldServerAuthHash}, settings.Transient.CredentialsFromCLI)
+	})
+
+	t.Run("cli auth password alone records the auth hash", func(t *testing.T) {
+		settings := config.Settings{}
+		applyCLIOverrides(&settings, makeOpts(t, "cli-password", ""), defaults)
+		assert.Equal(t, []string{config.FieldServerAuthHash}, settings.Transient.CredentialsFromCLI)
+	})
+
+	t.Run("cli auth hash alone records the auth hash", func(t *testing.T) {
+		settings := config.Settings{}
+		applyCLIOverrides(&settings, makeOpts(t, "auto", "cli-hash"), defaults) // "auto" is the default password
+		assert.Equal(t, []string{config.FieldServerAuthHash}, settings.Transient.CredentialsFromCLI)
+	})
+
+	t.Run("auto-generated auth is not recorded as a cli credential", func(t *testing.T) {
+		settings := config.Settings{Server: config.ServerSettings{Enabled: true}}
+		applyCLIOverrides(&settings, newDefaultOpts(t), defaults)
+		applyAutoAuthFallback(&settings)
+		assert.True(t, settings.Transient.AuthFromCLI, "fallback still keeps the hash across reloads")
+		assert.Empty(t, settings.Transient.CredentialsFromCLI)
 	})
 
 	t.Run("ListenAddr non-default overrides DB", func(t *testing.T) {
@@ -306,6 +360,7 @@ func TestOptToSettings(t *testing.T) {
 		o.CAS.API = "https://cas.example.com"
 		o.CAS.Timeout = 10 * time.Second
 		o.CAS.UserAgent = "test-agent"
+		o.CAS.Token = "test-cas-token"
 
 		o.Meta.LinksLimit = 2
 		o.Meta.MentionsLimit = 3
@@ -314,6 +369,7 @@ func TestOptToSettings(t *testing.T) {
 		o.Meta.LinksOnly = true
 		o.Meta.MentionOnly = true
 		o.Meta.VideosOnly = true
+		o.Meta.DocumentsOnly = true
 		o.Meta.AudiosOnly = true
 		o.Meta.Forward = true
 		o.Meta.Keyboard = true
@@ -369,6 +425,7 @@ func TestOptToSettings(t *testing.T) {
 		o.LuaPlugins.PluginsDir = "/custom/plugins"
 		o.LuaPlugins.EnabledPlugins = []string{"plugin1", "plugin2"}
 		o.LuaPlugins.DynamicReload = true
+		o.LuaPlugins.Unrestricted = true
 
 		o.AbnormalSpacing.Enabled = true
 		o.AbnormalSpacing.SpaceRatioThreshold = 0.4
@@ -451,6 +508,7 @@ func TestOptToSettings(t *testing.T) {
 				assert.Equal(t, "https://cas.example.com", settings.CAS.API)
 				assert.Equal(t, 10*time.Second, settings.CAS.Timeout)
 				assert.Equal(t, "test-agent", settings.CAS.UserAgent)
+				assert.Equal(t, "test-cas-token", settings.CAS.Token)
 
 				// meta settings
 				assert.Equal(t, 2, settings.Meta.LinksLimit)
@@ -460,6 +518,7 @@ func TestOptToSettings(t *testing.T) {
 				assert.True(t, settings.Meta.LinksOnly)
 				assert.True(t, settings.Meta.MentionOnly)
 				assert.True(t, settings.Meta.VideosOnly)
+				assert.True(t, settings.Meta.DocumentsOnly)
 				assert.True(t, settings.Meta.AudiosOnly)
 				assert.True(t, settings.Meta.Forward)
 				assert.True(t, settings.Meta.Keyboard)
@@ -554,6 +613,7 @@ func TestOptToSettings(t *testing.T) {
 				assert.Equal(t, "test-key", settings.Transient.ConfigDBEncryptKey)
 				assert.True(t, settings.Transient.Dbg)
 				assert.True(t, settings.Transient.TGDbg)
+				assert.True(t, settings.Transient.LuaUnrestricted)
 				assert.Equal(t, "secret", settings.Transient.WebAuthPasswd)
 			},
 		},
@@ -1094,6 +1154,32 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	})
 }
 
+func TestSaveConfigToDB_StoresCLICredentials(t *testing.T) {
+	setupLog(true)
+	dbFile := filepath.Join(t.TempDir(), "cli-credentials.db")
+	ctx := context.Background()
+
+	// save-config after --confdb loading carries CredentialsFromCLI; the explicit
+	// command must still write the command-line credential to the database
+	settings := &config.Settings{
+		InstanceID: "test-instance",
+		Jev:        config.JevSettings{Token: "cli-jev-token"},
+		Transient: config.TransientSettings{
+			DataBaseURL:        dbFile,
+			CredentialsFromCLI: []string{config.FieldJevToken},
+		},
+	}
+	require.NoError(t, saveConfigToDB(ctx, settings))
+	assert.Equal(t, []string{config.FieldJevToken}, settings.Transient.CredentialsFromCLI, "caller's settings are untouched")
+
+	loaded := &config.Settings{
+		InstanceID: "test-instance",
+		Transient:  config.TransientSettings{DataBaseURL: dbFile, ConfigDB: true},
+	}
+	require.NoError(t, loadConfigFromDB(ctx, loaded, nil))
+	assert.Equal(t, "cli-jev-token", loaded.Jev.Token)
+}
+
 func TestLoadConfigFromDB_AppliesDefaults(t *testing.T) {
 	setupLog(true)
 	tmpDir := t.TempDir()
@@ -1257,6 +1343,108 @@ func TestLoadConfigFromDB_DoesNotOverrideExisting(t *testing.T) {
 	assert.Equal(t, 99*time.Second, loaded.LLM.RequestTimeout, "DB value preserved, not replaced by template 30s")
 	assert.Equal(t, 4242, loaded.OpenAI.MaxSymbolsRequest, "DB value preserved, not replaced by template 16000")
 	assert.Equal(t, 48*time.Hour, loaded.History.Duration, "DB value preserved, not replaced by template 24h")
+}
+
+func TestLoadConfigFromDB_OmittedZeroAwareKeysGetDefaults(t *testing.T) {
+	setupLog(true)
+	type want struct {
+		links, mentions, emoji, first, rate, backups int
+		minProb, similarity                          float64
+	}
+	tests := []struct {
+		name string
+		blob string
+		want want
+	}{
+		{name: "omitted keys take defaults", blob: `{"telegram":{"token":"123:abc","group":"-100123"},"dry":false}`,
+			want: want{links: -1, mentions: -1, emoji: 2, first: 1, rate: 10, backups: 10, minProb: 50, similarity: 0.5}},
+		{name: "explicit zeros survive", blob: `{"meta":{"links_limit":0},"max_emoji":0,"report":{"rate_limit":0}}`,
+			want: want{links: 0, mentions: -1, emoji: 0, first: 1, rate: 0, backups: 10, minProb: 50, similarity: 0.5}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbFile := filepath.Join(t.TempDir(), "external-blob.db")
+			writeRawConfigBlob(t, dbFile, "test-instance", tt.blob)
+
+			defaults, err := defaultSettingsTemplate()
+			require.NoError(t, err)
+			loaded := &config.Settings{
+				InstanceID: "test-instance",
+				Transient:  config.TransientSettings{DataBaseURL: dbFile, ConfigDB: true},
+			}
+			require.NoError(t, loadConfigFromDB(ctx, loaded, defaults))
+
+			got := want{links: loaded.Meta.LinksLimit, mentions: loaded.Meta.MentionsLimit, emoji: loaded.MaxEmoji,
+				first: loaded.FirstMessagesCount, rate: loaded.Report.RateLimit, backups: loaded.MaxBackups,
+				minProb: loaded.MinSpamProbability, similarity: loaded.SimilarityThreshold}
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, "test-instance", loaded.InstanceID, "template instance id must not replace the CLI value")
+			assert.True(t, loaded.Transient.ConfigDB)
+		})
+	}
+}
+
+func TestMakeSettingsStore(t *testing.T) {
+	const key = "test-master-key-at-least-20-chars"
+	tests := []struct {
+		name, encryptKey string
+	}{
+		{name: "plain", encryptKey: ""},
+		{name: "encrypted", encryptKey: key},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			token := "123:abc"
+			if tt.encryptKey != "" {
+				crypter, err := config.NewCrypter(tt.encryptKey, "test-instance")
+				require.NoError(t, err)
+				token, err = crypter.Encrypt(token)
+				require.NoError(t, err)
+			}
+			dbFile := filepath.Join(t.TempDir(), "store.db")
+			writeRawConfigBlob(t, dbFile, "test-instance", `{"telegram":{"token":"`+token+`"},"meta":{"mentions_limit":0}}`)
+
+			db, err := engine.New(ctx, dbFile, "test-instance")
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			settings := &config.Settings{InstanceID: "test-instance",
+				Transient: config.TransientSettings{ConfigDBEncryptKey: tt.encryptKey}}
+			store, err := makeSettingsStore(ctx, db, settings)
+			require.NoError(t, err)
+
+			loaded, err := store.Load(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, -1, loaded.Meta.LinksLimit, "omitted zero-aware key takes its default")
+			assert.Equal(t, 0, loaded.Meta.MentionsLimit, "stored zero kept")
+			assert.Equal(t, "123:abc", loaded.Telegram.Token)
+			assert.Empty(t, loaded.InstanceID)
+		})
+	}
+
+	t.Run("bad encryption key", func(t *testing.T) {
+		db, err := engine.New(context.Background(), filepath.Join(t.TempDir(), "store.db"), "test-instance")
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		settings := &config.Settings{Transient: config.TransientSettings{ConfigDBEncryptKey: "short"}}
+		_, err = makeSettingsStore(context.Background(), db, settings)
+		require.ErrorContains(t, err, "invalid encryption key for settings store")
+	})
+}
+
+func writeRawConfigBlob(t *testing.T, dbFile, gid, data string) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := engine.New(ctx, dbFile, gid)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	_, err = config.NewStore(ctx, db)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO config (gid, data) VALUES (?, ?)", gid, data)
+	require.NoError(t, err)
 }
 
 func TestDefaultSettingsTemplate_KeyFields(t *testing.T) {
@@ -1527,4 +1715,102 @@ func Test_applyAutoAuthFallback_NonEmptyPasswdHonored(t *testing.T) {
 
 	assert.Equal(t, "custom", settings.Transient.WebAuthPasswd, "existing custom password must not be overwritten by 'auto'")
 	assert.Empty(t, settings.Server.AuthHash)
+}
+
+func TestOptToSettings_Jev(t *testing.T) {
+	var opts options
+	opts.Jev.Token = "jev-token"
+	opts.Jev.APIBase = "https://proxy.example/v1"
+	opts.Jev.Veto = true
+	opts.Jev.Model = "jev-1.13.0"
+	opts.Jev.Question = "Is `message` spam?"
+	opts.Jev.CriteriaSpam = "promotes"
+	opts.Jev.CriteriaHam = "conversation"
+	opts.Jev.Threshold = 0.42
+	opts.Jev.MaxSymbolsRequest = 1234
+	opts.Jev.RetryCount = 3
+	opts.Jev.HistorySize = 7
+	opts.Jev.CheckShortMessages = true
+	opts.Jev.GibberishThreshold = 0.55
+
+	got := optToSettings(opts)
+	assert.Equal(t, "jev-token", got.Jev.Token)
+	assert.Equal(t, "https://proxy.example/v1", got.Jev.APIBase)
+	assert.True(t, got.Jev.Veto)
+	assert.Equal(t, "jev-1.13.0", got.Jev.Model)
+	assert.Equal(t, "Is `message` spam?", got.Jev.Question)
+	assert.Equal(t, "promotes", got.Jev.CriteriaSpam)
+	assert.Equal(t, "conversation", got.Jev.CriteriaHam)
+	assert.InDelta(t, 0.42, got.Jev.Threshold, 0.0001)
+	assert.Equal(t, 1234, got.Jev.MaxSymbolsRequest)
+	assert.Equal(t, 3, got.Jev.RetryCount)
+	assert.Equal(t, 7, got.Jev.HistorySize)
+	assert.True(t, got.Jev.CheckShortMessages)
+	assert.InDelta(t, 0.55, got.Jev.GibberishThreshold, 0.0001)
+}
+
+// the question and criteria defaults must arrive from the struct tags, because
+// defaultSettingsTemplate fills by reflection over them before Validate runs
+func TestJevTokenOnlyStartupPassesValidate(t *testing.T) {
+	template, err := defaultSettingsTemplate()
+	require.NoError(t, err)
+
+	require.NotEmpty(t, template.Jev.Question, "question default must come from the struct tag")
+	require.NotEmpty(t, template.Jev.CriteriaSpam)
+	require.NotEmpty(t, template.Jev.CriteriaHam)
+	assert.InDelta(t, 0.30, template.Jev.Threshold, 0.0001)
+	assert.Zero(t, template.Jev.GibberishThreshold, "the gibberish check is opt-in")
+	assert.Equal(t, 6000, template.Jev.MaxSymbolsRequest)
+	assert.Equal(t, "jev-1.13.0", template.Jev.Model)
+	assert.Empty(t, template.Jev.APIBase, "apibase must carry no default, or token-only gating breaks")
+
+	template.Jev.Token = "only-a-token"
+	require.NoError(t, template.Validate())
+}
+
+func TestJevFrozenPolicyDefaultsMatchAppendix(t *testing.T) {
+	template, err := defaultSettingsTemplate()
+	require.NoError(t, err)
+
+	const (
+		wantQuestion     = "Is `message`, posted in a public Telegram group chat, spam?"
+		wantCriteriaSpam = "It promotes, advertises, or offers paid services, paid subscriptions, paid content, donations, crypto wallets, paid promotion of content or accounts, job recruitment, hiring, looking for employees, unsolicited job postings, easy money offers, work-from-home offers with specific payment amounts, VPN promotion, or invitations to join Telegram bots or channels for earnings."
+		wantCriteriaHam  = "Ordinary conversation between chat members. Casual discussion or mentioning prices of well-known services and products such as GitHub Copilot, ChatGPT Plus, cloud providers or software tools is NOT spam. Off-topic banter, rudeness, profanity, questions, and links shared as part of a conversation are NOT spam. Only direct selling, promoting, or advertising counts as spam."
+	)
+	assert.Equal(t, wantQuestion, template.Jev.Question)
+	assert.Equal(t, wantCriteriaSpam, template.Jev.CriteriaSpam)
+	assert.Equal(t, wantCriteriaHam, template.Jev.CriteriaHam)
+}
+
+func TestJevCustomQuestionOverridesDefault(t *testing.T) {
+	template, err := defaultSettingsTemplate()
+	require.NoError(t, err)
+
+	var opts options
+	opts.Jev.Token = "t"
+	opts.Jev.Question = "a different question entirely"
+	opts.Jev.CriteriaSpam = "custom spam"
+	opts.Jev.CriteriaHam = "custom ham"
+	opts.Jev.Threshold = 0.5
+
+	got := optToSettings(opts)
+	got.ApplyDefaults(template)
+	assert.Equal(t, "a different question entirely", got.Jev.Question,
+		"an explicit question must replace the default, not merge with it")
+	assert.Equal(t, "custom spam", got.Jev.CriteriaSpam)
+	require.NoError(t, got.Validate())
+}
+
+func TestJevNaNThresholdRejectedFromCLIPath(t *testing.T) {
+	var opts options
+	opts.Jev.Token = "t"
+	opts.Jev.Question = "q"
+	opts.Jev.CriteriaSpam = "s"
+	opts.Jev.CriteriaHam = "h"
+	opts.Jev.Threshold = math.NaN()
+
+	got := optToSettings(opts)
+	err := got.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "finite")
 }

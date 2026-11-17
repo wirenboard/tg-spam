@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"time"
 
@@ -27,6 +28,7 @@ type Settings struct {
 	Meta          MetaSettings          `json:"meta" yaml:"meta" db:"meta"`
 	OpenAI        OpenAISettings        `json:"openai" yaml:"openai" db:"openai"`
 	Gemini        GeminiSettings        `json:"gemini" yaml:"gemini" db:"gemini"`
+	Jev           JevSettings           `json:"jev" yaml:"jev" db:"jev"`
 	LLM           LLMSettings           `json:"llm" yaml:"llm" db:"llm"`
 	LuaPlugins    LuaPluginsSettings    `json:"lua_plugins" yaml:"lua_plugins" db:"lua_plugins"`
 	AbnormalSpace AbnormalSpaceSettings `json:"abnormal_spacing" yaml:"abnormal_spacing" db:"abnormal_spacing"`
@@ -106,6 +108,7 @@ type LoggerSettings struct {
 // CASSettings contains Combot Anti-Spam System settings
 type CASSettings struct {
 	API       string        `json:"api" yaml:"api" db:"cas_api"`
+	Token     string        `json:"token" yaml:"token" db:"cas_token"`
 	Timeout   time.Duration `json:"timeout" yaml:"timeout" db:"cas_timeout"`
 	UserAgent string        `json:"user_agent" yaml:"user_agent" db:"cas_user_agent"`
 }
@@ -119,6 +122,7 @@ type MetaSettings struct {
 	LinksOnly       bool   `json:"links_only" yaml:"links_only" db:"meta_links_only"`
 	MentionOnly     bool   `json:"mention_only" yaml:"mention_only" db:"meta_mention_only"`
 	VideosOnly      bool   `json:"videos_only" yaml:"videos_only" db:"meta_videos_only"`
+	DocumentsOnly   bool   `json:"documents_only" yaml:"documents_only" db:"meta_documents_only"`
 	AudiosOnly      bool   `json:"audios_only" yaml:"audios_only" db:"meta_audios_only"`
 	Forward         bool   `json:"forward" yaml:"forward" db:"meta_forward"`
 	Keyboard        bool   `json:"keyboard" yaml:"keyboard" db:"meta_keyboard"`
@@ -157,6 +161,23 @@ type GeminiSettings struct {
 	RetryCount         int      `json:"retry_count" yaml:"retry_count" db:"gemini_retry_count"`
 	HistorySize        int      `json:"history_size" yaml:"history_size" db:"gemini_history_size"`
 	CheckShortMessages bool     `json:"check_short_messages" yaml:"check_short_messages" db:"gemini_check_short_messages"`
+}
+
+// JevSettings contains jev decision-model integration settings
+type JevSettings struct {
+	Token              string  `json:"token" yaml:"token" db:"jev_token"`
+	APIBase            string  `json:"api_base" yaml:"api_base" db:"jev_api_base"`
+	Veto               bool    `json:"veto" yaml:"veto" db:"jev_veto"`
+	Model              string  `json:"model" yaml:"model" db:"jev_model"`
+	Question           string  `json:"question" yaml:"question" db:"jev_question"`
+	CriteriaSpam       string  `json:"criteria_spam" yaml:"criteria_spam" db:"jev_criteria_spam"`
+	CriteriaHam        string  `json:"criteria_ham" yaml:"criteria_ham" db:"jev_criteria_ham"`
+	Threshold          float64 `json:"threshold" yaml:"threshold" db:"jev_threshold"`
+	MaxSymbolsRequest  int     `json:"max_symbols_request" yaml:"max_symbols_request" db:"jev_max_symbols_request"`
+	RetryCount         int     `json:"retry_count" yaml:"retry_count" db:"jev_retry_count"`
+	HistorySize        int     `json:"history_size" yaml:"history_size" db:"jev_history_size"`
+	CheckShortMessages bool    `json:"check_short_messages" yaml:"check_short_messages" db:"jev_check_short_messages"`
+	GibberishThreshold float64 `json:"gibberish_threshold" yaml:"gibberish_threshold" db:"jev_gibberish_threshold"`
 }
 
 // LLMSettings contains shared LLM orchestration settings
@@ -228,7 +249,6 @@ type MessageSettings struct {
 	Spam    string `json:"spam" yaml:"spam" db:"message_spam"`
 	Dry     string `json:"dry" yaml:"dry" db:"message_dry"`
 	Warn    string `json:"warn" yaml:"warn" db:"message_warn"`
-	Restore string `json:"restore" yaml:"restore" db:"message_restore"`
 }
 
 // ServerSettings contains web server settings
@@ -253,6 +273,9 @@ type TransientSettings struct {
 	// encryption for database stored configuration
 	ConfigDBEncryptKey string `json:"-" yaml:"-"`
 
+	// LuaUnrestricted gives Lua plugins every library, os and io included
+	LuaUnrestricted bool `json:"-" yaml:"-"`
+
 	// temporary auth password (used only to generate hash)
 	WebAuthPasswd string `json:"-" yaml:"-"`
 
@@ -264,6 +287,14 @@ type TransientSettings struct {
 	// reloads so the override survives; when false, reload picks up fresh
 	// DB values.
 	AuthFromCLI bool `json:"-" yaml:"-"`
+
+	// CredentialsFromCLI lists the sensitive fields (Field* names) whose in-memory
+	// value was supplied on the command line or through the environment. Such a
+	// value belongs to the process, not to the database: Store.Save writes the
+	// value already stored in the database for these fields instead, and
+	// loadConfigHandler keeps the in-memory value across reloads. Explicit
+	// persistence (the save-config command) clears the list first.
+	CredentialsFromCLI []string `json:"-" yaml:"-"`
 }
 
 // New creates a new settings instance
@@ -304,12 +335,65 @@ func (s *Settings) Validate() error {
 	if s.MaxShortMsgCount > 0 && s.ParanoidMode {
 		return fmt.Errorf("max-short-msg-count is incompatible with paranoid mode")
 	}
+	// isShortMsgFlood skips any message at least MinMsgLen runes long: 0 exempts everything and 1
+	// every non-empty message, so short text probes, the pattern the check targets, never count.
+	if s.MaxShortMsgCount > 0 && s.MinMsgLen <= 1 {
+		return fmt.Errorf("max-short-msg-count requires min-msg-len > 1 (got %d)", s.MinMsgLen)
+	}
 	// ValidateProhibitedLangs already returns a fully-formed, user-facing message
 	// shared across all call sites; return it verbatim.
 	if err := tgspam.ValidateProhibitedLangs(s.ProhibitedLangs, s.ProhibitedLangsMin); err != nil {
 		return err //nolint:wrapcheck // message is already contextual and shared across call sites
 	}
+	if err := s.validateJev(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateJev enforces the same contract newJevChecker does, gated on the same predicate the
+// startup wiring uses, so a config accepted here can never fail to construct at next startup.
+func (s *Settings) validateJev() error {
+	if !s.IsJevEnabled() {
+		return nil
+	}
+	if math.IsNaN(s.Jev.Threshold) || math.IsInf(s.Jev.Threshold, 0) {
+		return fmt.Errorf("jev.threshold (%v) must be a finite number", s.Jev.Threshold)
+	}
+	if s.Jev.Threshold <= 0 || s.Jev.Threshold > 1 {
+		return fmt.Errorf("jev.threshold (%v) must be in (0, 1]", s.Jev.Threshold)
+	}
+	if s.Jev.MaxSymbolsRequest < 0 {
+		return fmt.Errorf("jev.max-symbols-request (%d) must be >= 0 (0 uses the default)", s.Jev.MaxSymbolsRequest)
+	}
+	if s.Jev.Question == "" {
+		return fmt.Errorf("jev.question must not be empty")
+	}
+	if s.Jev.CriteriaSpam == "" {
+		return fmt.Errorf("jev.criteria-spam must not be empty")
+	}
+	if s.Jev.CriteriaHam == "" {
+		return fmt.Errorf("jev.criteria-ham must not be empty")
+	}
+	if math.IsNaN(s.Jev.GibberishThreshold) || math.IsInf(s.Jev.GibberishThreshold, 0) {
+		return fmt.Errorf("jev.gibberish-threshold (%v) must be a finite number", s.Jev.GibberishThreshold)
+	}
+	if s.Jev.GibberishThreshold < 0 || s.Jev.GibberishThreshold > 1 {
+		return fmt.Errorf("jev.gibberish-threshold (%v) must be in [0, 1] (0 disables)", s.Jev.GibberishThreshold)
+	}
+	// history is flattened into the judged message, so an uncaught gibberish post in the ham history would
+	// reach every later request; that combination was never evaluated
+	if s.Jev.GibberishThreshold > 0 && s.Jev.HistorySize > 0 {
+		return fmt.Errorf("jev.gibberish-threshold requires jev.history-size 0, got %d", s.Jev.HistorySize)
+	}
+	return nil
+}
+
+// IsJevEnabled returns true if jev integration is enabled. Token only, unlike IsOpenAIEnabled:
+// --jev.apibase carries no default tag, but gating on it would still enable jev for anyone who
+// points it at a proxy without a credential.
+func (s *Settings) IsJevEnabled() bool {
+	return s.Jev.Token != ""
 }
 
 // IsOpenAIEnabled returns true if OpenAI integration is enabled
@@ -325,6 +409,7 @@ func (s *Settings) IsMetaEnabled() bool {
 		s.Meta.LinksOnly ||
 		s.Meta.MentionOnly ||
 		s.Meta.VideosOnly ||
+		s.Meta.DocumentsOnly ||
 		s.Meta.AudiosOnly ||
 		s.Meta.Forward ||
 		s.Meta.Keyboard ||
@@ -334,7 +419,8 @@ func (s *Settings) IsMetaEnabled() bool {
 		s.Meta.ExternalReply
 }
 
-// IsCASEnabled returns true if CAS integration is enabled
+// IsCASEnabled returns true if the CAS API URL is set. The check also needs CAS.Token and is
+// skipped without it; this reports the configured intent the web form's toggle edits.
 func (s *Settings) IsCASEnabled() bool {
 	return s.CAS.API != ""
 }
@@ -367,6 +453,8 @@ var zeroAwarePaths = map[string]bool{
 	"Warn.Threshold":          true, // app/main.go, app/events/admin.go (> 0): 0 disables
 	"OpenAI.HistorySize":      true, // lib/tgspam/detector.go:409 (> 0): 0 disables history
 	"Gemini.HistorySize":      true, // lib/tgspam/detector.go:409 (> 0): 0 disables history
+	"Jev.HistorySize":         true, // lib/tgspam/detector.go:409 (> 0): 0 disables history
+	"Jev.GibberishThreshold":  true, // lib/tgspam/jev.go buildRequest (> 0): 0 disables the gibberish question
 	"FirstMessagesCount":      true, // app/main.go:703, lib/tgspam/detector.go:205,208 (> 0): 0 disables
 	"SimilarityThreshold":     true, // lib/tgspam/detector.go:302 (> 0): 0 disables similarity check
 	"MinSpamProbability":      true, // lib/tgspam/detector.go:1014 (== 0): 0 = always classify spam
