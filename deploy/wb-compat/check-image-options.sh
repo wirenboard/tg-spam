@@ -15,6 +15,10 @@ if ! printf '%s\n' "$help" | grep -q 'Application Options'; then
   printf '%s\n' "$help" | tail -n 20 >&2
   exit 1
 fi
+# without a terminal go-flags wraps the help at 80 columns, and a word too long for the
+# description column is cut with "-" and continued after a blank line:
+# "[$DISABLE_ADMIN_SPAM-", "", "_FORWARD]". One line, cuts joined back
+help=$(printf '%s\n' "$help" | tr '\n' ' ' | sed 's/- \{1,\}//g')
 
 fail=0
 for f in docker-compose.portainer.yml deploy/wb-compat/docker-compose.update-channel.yml; do
