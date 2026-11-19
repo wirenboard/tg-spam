@@ -5,8 +5,8 @@
 # make the next upstream merge conflict, so it fails here instead. Code changes to the bot go
 # to deploy/wb-compat/patches.
 #
-# wb-upstream-sync.yml also relies on it: after a squash merge master has a release's files
-# but not its history, and only this check makes it safe to record the release as merged.
+# merge-upstream.sh also relies on it: after a squash merge master has a release's files but
+# not its history, and only this check makes it safe to record the release as merged.
 set -eu
 cd "$(dirname "$0")/../.."
 

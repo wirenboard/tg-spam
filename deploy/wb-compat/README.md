@@ -83,24 +83,32 @@ the change upstream: every patch is code this fork has to carry through each rel
 
 ## Updating from upstream
 
-`.github/workflows/wb-upstream-sync.yml` prepares each upstream release with no one
-involved, and a person decides whether to take it. Every morning it merges the newest
-upstream release into a branch off `master`, pushes it as `sync/upstream-<tag>`, starts
-`wb-image.yml` on it and opens the pull request "Merge upstream <tag>". The checks are the
-ones every branch gets: the rendered stack config, upstream's files untouched, the tests of
-the patched packages, the image build, and that every variable the two compose files set is
-still an option of the new binary.
+Updates are taken by hand, when someone decides to. Upstream's releases and their notes are
+at [umputun/tg-spam releases](https://github.com/umputun/tg-spam/releases);
+`UPSTREAM_VERSION` says which one `master` is on.
 
-To take the release, read its notes (the pull request links them) and merge once the
-checks are green: the push to `master` publishes the image and redeploys both stacks.
+```sh
+git fetch origin
+git switch -c upstream-v1.30.0 origin/master
+sh deploy/wb-compat/merge-upstream.sh v1.30.0   # without a tag: the newest release
+git push -u origin HEAD
+```
+
+`merge-upstream.sh` merges the release, keeps this fork's `.github/workflows` (upstream's
+workflows are not kept here) and moves `UPSTREAM_VERSION` to the new tag. Then open a pull
+request into `master` of wirenboard/tg-spam - GitHub offers umputun/tg-spam as the base by
+default. `wb-image.yml` checks the branch the way it checks any branch: the rendered stack
+config, upstream's files untouched, the tests of the patched packages, the image build, and
+that every variable the two compose files set is still an option of the new binary. Merge
+when it is green: the push to `master` publishes the image and redeploys both stacks.
+
 Prefer **Create a merge commit**, which keeps upstream's history in `master`. A squash
-merge works too: `UPSTREAM_VERSION` names the release `master` is on, and the next sync
-records it as merged once the files match it. To decline a release, close the pull request
-and keep its branch: the sync skips a release whose branch exists and proposes the next one
-when it comes out.
+merge works too: `merge-upstream.sh` finds the release named in `UPSTREAM_VERSION` missing
+from the history and, once the files are checked to be exactly that release, records it as
+merged.
 
-Red checks on a sync pull request mean the release needs a hand first, usually a patch
-that no longer applies because upstream changed the very lines around it:
+Red checks usually mean a patch that no longer applies because upstream changed the very
+lines around it:
 
 1. In a clone of this repository, check the release tag out into a scratch worktree
    (`git worktree add ../scratch <tag>`) and apply the patch there with
@@ -109,29 +117,16 @@ that no longer applies because upstream changed the very lines around it:
    (`go test -short ./app/...`), commit, and regenerate the file with
    `git format-patch -1 --full-index --stdout`. `--full-index` matters: the full blob ids in
    the patch are what lets the next release apply it three-way.
-3. Commit the refreshed patch to `sync/upstream-<tag>` and push: the pull request picks it
-   up and `wb-image.yml` checks it again.
+3. Commit the refreshed patch to the update branch and push: the pull request picks it up
+   and `wb-image.yml` checks it again.
 
 When upstream gains the same feature, delete the patch and switch the compose files to
 upstream's option. With `patches/` empty, the image is plain upstream plus our preset
 stop phrases.
 
-To propose a release right away, or an older one, run the workflow from the Actions tab
-(with a tag for an older one). A manual `git merge <tag>` conflicts only under
-`.github/workflows`, where this fork's side stays; set `UPSTREAM_VERSION` to the tag in the
-same commit.
-
-The sync opens its pull request with the built-in token, which needs **Allow GitHub Actions
-to create and approve pull requests** in the repository's or the organization's Actions
-settings. Without it the run fails after pushing the branch and prints the link to open the
-pull request by hand.
-
-GitHub turns off a schedule in a public repository after 60 days without a commit and
-warns by mail first. A quiet upstream can get there; the Actions tab turns it back on.
-
 ## How an update reaches the bots
 
-Push to `master` (a merged pull request, an upstream sync one included) →
+Push to `master` (a merged pull request) →
 `.github/workflows/wb-image.yml` asserts the rendered production config, tests and builds
 the patched image, checks that it still has every option the stacks set, publishes it to
 ghcr, and only then calls the Portainer webhooks that redeploy the stacks. A failed check
