@@ -94,6 +94,8 @@ need 'SOFT_BAN: "?true"?'
 need 'DISABLE_ADMIN_SPAM_FORWARD: "?true"?'
 need 'MIN_MSG_LEN: "?20"?'
 need 'SIMILARITY_THRESHOLD: "?0.7"?'
+# the stack sets false; the file default must agree, or dropping the variable flips the mode
+need 'OPENAI_VETO: "?false"?'
 # the volumes belong to the stack this one replaced, so they must stay external:
 # adopting them by label would fail, and a non-external declaration could delete them
 need 'external: true'

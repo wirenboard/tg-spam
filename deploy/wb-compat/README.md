@@ -29,7 +29,6 @@ these:
 
 | Variable | Support chat | Update channel | What it changes |
 |---|---|---|---|
-| `OPENAI_VETO` | `false` | `true` | In veto mode the model only confirms spam another check already flagged; with it off the model flags on its own. The channel leans on the model less and pays for fewer calls |
 | `MIN_MSG_LEN` | `40` | `20` | Shorter messages are skipped by the ordinary checks. Comments under a post are short, so the channel still looks at them |
 | `SIMILARITY_THRESHOLD` | `0.65` | `0.7` | How close to a known spam sample a message has to be. Higher catches less and misfires less |
 | `MAX_EMOJI` | `2` | `3` | |
@@ -38,7 +37,7 @@ these:
 | `SERVER_ENABLED` | `true`, published on `:8081` | no web UI | The channel's samples and stop-words can only be changed through the bot itself |
 | `SUPER_USER` | staff list | the same list plus one login | Both lists live in the stack environment, never in this public repository |
 
-Three further differences are structural rather than tuning, and they are why the two
+Two further differences are structural rather than tuning, and they are why the two
 stacks still need two compose files:
 
 - **The data volume is mounted at `/srv/var`** and `FILES_DYNAMIC=/srv/var` follows it.
@@ -47,18 +46,18 @@ stacks still need two compose files:
   replaced; nothing in the code needs it.
 - **The container runs as `root`**, because the files in that volume belong to root while
   the image runs as `app` (uid 1000).
-- **The stack is not deployed from git.** Its compose was pasted into the Portainer web
-  editor with every value hard-coded, instead of coming from the stack environment.
 
-Recreating that stack from `docker-compose.portainer.yml` would remove all three at once,
+The update channel's stack is deployed from this repository: Portainer reads
+`deploy/wb-compat/docker-compose.update-channel.yml`, and the values come from the stack
+environment. Moving it onto `docker-compose.portainer.yml` would remove both differences,
 but its data has to reach `/srv/data` first - either by moving the files inside the volume
-or by turning the mount point into a variable. A stack's repository URL cannot be changed
-after creation, so moving the stack to this repository needs a recreation regardless.
+or by turning the mount point into a variable.
 
 ## What is ours in this repository
 
 Everything outside these paths is upstream [umputun/tg-spam](https://github.com/umputun/tg-spam)
-byte for byte, at the release last merged:
+byte for byte, at the release named in `deploy/wb-compat/UPSTREAM_VERSION`;
+`check-upstream-files.sh` asserts it on every push:
 
 - `deploy/wb-compat/` - this README, the update channel's compose file, the build and check
   scripts, our patches and our preset data;
@@ -84,15 +83,24 @@ the change upstream: every patch is code this fork has to carry through each rel
 
 ## Updating from upstream
 
-`.github/workflows/wb-upstream-sync.yml` does it every morning with no one involved: it
-merges the newest upstream release into `master`, runs the same checks as a pull request
-(rendered stack config, the tests of the patched packages, the image build, and that every
-variable the two compose files set is still an option of the new binary), pushes the merge
-and starts `wb-image.yml`. Nothing to do while it stays green.
+`.github/workflows/wb-upstream-sync.yml` prepares each upstream release with no one
+involved, and a person decides whether to take it. Every morning it merges the newest
+upstream release into a branch off `master`, pushes it as `sync/upstream-<tag>`, starts
+`wb-image.yml` on it and opens the pull request "Merge upstream <tag>". The checks are the
+ones every branch gets: the rendered stack config, upstream's files untouched, the tests of
+the patched packages, the image build, and that every variable the two compose files set is
+still an option of the new binary.
 
-When it fails, nothing has reached `master` or the bots. The run's log says why; if the
-merge itself went through, it waits on the branch `sync/upstream-<tag>`. The usual cause is
-a patch that no longer applies because upstream changed the lines around it:
+To take the release, read its notes (the pull request links them) and merge once the
+checks are green: the push to `master` publishes the image and redeploys both stacks.
+Prefer **Create a merge commit**, which keeps upstream's history in `master`. A squash
+merge works too: `UPSTREAM_VERSION` names the release `master` is on, and the next sync
+records it as merged once the files match it. To decline a release, close the pull request
+and keep its branch: the sync skips a release whose branch exists and proposes the next one
+when it comes out.
+
+Red checks on a sync pull request mean the release needs a hand first, usually a patch
+that no longer applies because upstream changed the very lines around it:
 
 1. In a clone of this repository, check the release tag out into a scratch worktree
    (`git worktree add ../scratch <tag>`) and apply the patch there with
@@ -101,23 +109,29 @@ a patch that no longer applies because upstream changed the lines around it:
    (`go test -short ./app/...`), commit, and regenerate the file with
    `git format-patch -1 --full-index --stdout`. `--full-index` matters: the full blob ids in
    the patch are what lets the next release apply it three-way.
-3. Commit the refreshed patch to `sync/upstream-<tag>`, push, open a pull request into
-   `master` and merge it once `wb-image.yml` is green.
+3. Commit the refreshed patch to `sync/upstream-<tag>` and push: the pull request picks it
+   up and `wb-image.yml` checks it again.
 
 When upstream gains the same feature, delete the patch and switch the compose files to
 upstream's option. With `patches/` empty, the image is plain upstream plus our preset
 stop phrases.
 
-A release can also be merged by hand, or an older one picked: run the workflow from the
-Actions tab with a tag. A manual `git merge <tag>` conflicts only under
-`.github/workflows`; keep this fork's side there.
+To propose a release right away, or an older one, run the workflow from the Actions tab
+(with a tag for an older one). A manual `git merge <tag>` conflicts only under
+`.github/workflows`, where this fork's side stays; set `UPSTREAM_VERSION` to the tag in the
+same commit.
+
+The sync opens its pull request with the built-in token, which needs **Allow GitHub Actions
+to create and approve pull requests** in the repository's or the organization's Actions
+settings. Without it the run fails after pushing the branch and prints the link to open the
+pull request by hand.
 
 GitHub turns off a schedule in a public repository after 60 days without a commit and
 warns by mail first. A quiet upstream can get there; the Actions tab turns it back on.
 
 ## How an update reaches the bots
 
-Push to `master` (by a merged pull request or by the upstream sync) →
+Push to `master` (a merged pull request, an upstream sync one included) →
 `.github/workflows/wb-image.yml` asserts the rendered production config, tests and builds
 the patched image, checks that it still has every option the stacks set, publishes it to
 ghcr, and only then calls the Portainer webhooks that redeploy the stacks. A failed check

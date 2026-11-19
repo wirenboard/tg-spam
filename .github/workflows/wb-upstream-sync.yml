@@ -1,20 +1,20 @@
 name: wb-upstream-sync
 
-# Follows umputun/tg-spam releases with no one involved. Once a day it merges the newest
-# upstream release tag into master, checks the result the way wb-image.yml checks a pull
-# request, pushes it and starts wb-image.yml, which publishes the image and redeploys both
-# stacks.
+# Prepares each new umputun/tg-spam release and leaves the decision to a person. Once a day
+# it merges the newest upstream release tag into a branch off master, pushes it as
+# sync/upstream-<tag>, starts wb-image.yml on it and opens a pull request. wb-image.yml runs
+# the checks every branch gets: rendered stack config, upstream files untouched, the tests of
+# the patched packages, the image build, the options the stacks set. Merging the pull request
+# publishes the image and redeploys both stacks; closing it declines the release.
 #
-# The merge itself cannot conflict: every upstream file is untouched in this fork, ours live in
-# deploy/wb-compat, docker-compose.portainer.yml and .github/workflows/wb-*.yml (README.md in
-# deploy/wb-compat explains why). The one exception is .github/workflows: upstream's workflows
-# are not kept here, and GITHUB_TOKEN may not push a change to any workflow file, so the merge
-# drops whatever upstream changed there.
+# The merge itself cannot conflict: every upstream file is untouched in this fork, ours live
+# in deploy/wb-compat, docker-compose.portainer.yml and .github/workflows/wb-*.yml (see
+# "What is ours" in deploy/wb-compat/README.md). The one exception is .github/workflows:
+# upstream's workflows are not kept here, and GITHUB_TOKEN may not push a change to any
+# workflow file, so the merge drops whatever upstream changed there.
 #
-# What can go wrong is a patch from deploy/wb-compat/patches that no longer applies, a failing
-# test, or an option the stacks set that the release renamed. Then nothing reaches master: the
-# run fails (GitHub mails whoever last changed this file) and the merge waits on the branch
-# sync/upstream-<tag> to be fixed by hand, see "Updating from upstream" in the README.
+# A push or a pull request made with GITHUB_TOKEN starts no workflow, hence the explicit
+# workflow_dispatch of wb-image.yml on the branch.
 
 on:
   schedule:
@@ -22,12 +22,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: upstream tag to merge, the latest release when empty
+        description: upstream tag to propose, the latest release when empty
         required: false
 
 permissions:
-  contents: write # push the merge to master, or to the sync branch when it fails
-  actions: write # start wb-image.yml
+  contents: write # push the sync branch
+  pull-requests: write # open its pull request
+  actions: write # start wb-image.yml on it
 
 concurrency:
   group: wb-upstream-sync
@@ -43,7 +44,7 @@ jobs:
           ref: master
           fetch-depth: 0
 
-      - name: find the release to merge
+      - name: find the release to propose
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,17 +52,18 @@ jobs:
         run: |
           set -eu
           tag=${WANTED:-$(gh api repos/umputun/tg-spam/releases/latest --jq .tag_name)}
-          git fetch --no-tags https://github.com/umputun/tg-spam.git "refs/tags/$tag:refs/tags/$tag"
-          if git merge-base --is-ancestor "$tag" HEAD; then
-            echo "master already contains $tag"
-            echo "tag=" >> "$GITHUB_OUTPUT"
+          current=$(tr -d ' \r\n' < deploy/wb-compat/UPSTREAM_VERSION)
+          if [ "$tag" = "$current" ]; then
+            echo "master is on $tag already"
+          elif git ls-remote --exit-code --heads origin "sync/upstream-$tag" > /dev/null; then
+            # an open pull request waits for a decision, or a closed one declined the release
+            echo "$tag was proposed already, on sync/upstream-$tag"
           else
-            echo "merging $tag"
+            echo "proposing $tag, master is on $current"
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: merge it
-        id: merge
+      - name: merge it into the sync branch
         if: steps.release.outputs.tag != ''
         env:
           TAG: ${{ steps.release.outputs.tag }}
@@ -69,6 +71,19 @@ jobs:
           set -eu
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch -q --no-tags https://github.com/umputun/tg-spam.git "refs/tags/$TAG:refs/tags/$TAG"
+          git checkout -q -b "sync/upstream-$TAG"
+
+          # a squash merge of an earlier sync pull request leaves master with the files of the
+          # release it is on but not its history, and the merge below would replay that release
+          # as conflicts. With the files checked to be exactly that release, recording it as
+          # merged is the truth
+          current=$(tr -d ' \r\n' < deploy/wb-compat/UPSTREAM_VERSION)
+          sh deploy/wb-compat/check-upstream-files.sh
+          if ! git merge-base --is-ancestor "$current" HEAD; then
+            git merge -q -s ours --no-edit -m "Record upstream $current as merged" "$current"
+          fi
+
           git merge --no-ff --no-commit "$TAG" || true
           # .github/workflows keeps only this fork's own workflows, as they are in master
           for f in $( { git diff --name-only --diff-filter=U -- .github/workflows
@@ -85,37 +100,28 @@ jobs:
             echo "::error::$TAG conflicts with this fork in: $conflicts"
             exit 1
           fi
+          echo "$TAG" > deploy/wb-compat/UPSTREAM_VERSION
+          git add deploy/wb-compat/UPSTREAM_VERSION
           git commit -q -m "Merge upstream $TAG"
-          git log --oneline -1
+          git push -q origin "HEAD:refs/heads/sync/upstream-$TAG"
 
-      - name: check rendered stack config
-        if: steps.merge.outcome == 'success'
-        run: sh deploy/wb-compat/check-stack-config.sh
-
-      - name: test patched packages
-        if: steps.merge.outcome == 'success'
-        run: sh deploy/wb-compat/test-image-tree.sh
-
-      - name: build the image and check the options the stacks set
-        if: steps.merge.outcome == 'success'
-        run: |
-          set -eu
-          IMAGE=tg-spam-wb:sync sh deploy/wb-compat/build-image.sh
-          sh deploy/wb-compat/check-image-options.sh tg-spam-wb:sync
-
-      - name: push to master and deploy
-        if: steps.merge.outcome == 'success'
+      - name: check it and open the pull request
+        if: steps.release.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          git push origin HEAD:master
-          gh workflow run wb-image.yml --ref master
-
-      - name: keep the failed merge for a human
-        if: failure() && steps.merge.outcome == 'success'
-        env:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
-          git push --force origin "HEAD:refs/heads/sync/upstream-$TAG"
-          echo "::error::$TAG merged but failed the checks, nothing was deployed; the merge is on sync/upstream-$TAG"
+          set -eu
+          branch="sync/upstream-$TAG"
+          gh workflow run wb-image.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          body="Upstream release [$TAG](https://github.com/umputun/tg-spam/releases/tag/$TAG), merged by wb-upstream-sync.yml.
+
+          - wb-image.yml checks this branch: stack config, upstream files, the tests of the patched packages, the image build, the options the stacks set. Merge only when it is green.
+          - Merging publishes the image and redeploys both stacks. Prefer **Create a merge commit**; a squash merge also works.
+          - To decline the release, close this pull request and keep the branch.
+          - Red checks: deploy/wb-compat/README.md, \"Updating from upstream\", says how to refresh a patch on this branch."
+          if ! gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" \
+            --title "Merge upstream $TAG" --body "$body"; then
+            echo "::error::the pull request could not be opened (GitHub Actions may not be allowed to create pull requests here); open it by hand: https://github.com/$GITHUB_REPOSITORY/compare/master...$branch"
+            exit 1
+          fi

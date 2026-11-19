@@ -27,7 +27,9 @@ concurrency:
 
 jobs:
   # Gate the deploy on the rendered production config, not just on the code: a broken
-  # compose file would otherwise reach the stacks through the webhook below.
+  # compose file would otherwise reach the stacks through the webhook below. Also keep every
+  # upstream file exactly the release in UPSTREAM_VERSION, which is what keeps upstream
+  # merges free of conflicts.
   check-config:
     runs-on: ubuntu-latest
     steps:
@@ -35,9 +37,14 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # the history holds the upstream release, so comparing with it fetches next to nothing
+          fetch-depth: 0
 
       - name: check rendered stack config
         run: sh deploy/wb-compat/check-stack-config.sh
+
+      - name: check upstream files are untouched
+        run: sh deploy/wb-compat/check-upstream-files.sh
 
   # The tests of the packages our patches touch, on the patched copy of the tree. A patch that
   # no longer applies to the upstream version in this tree fails here.
