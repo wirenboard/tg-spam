@@ -1,16 +1,33 @@
 name: wb-image
 
-# Publishes the image this fork's Portainer stacks run. Upstream's docker.yml needs
-# PKG_TOKEN/DOCKER_HUB_TOKEN, which only exist in umputun/tg-spam, so it cannot serve
-# the fork. The built-in GITHUB_TOKEN is enough to push to the fork's own ghcr namespace.
+# Builds and publishes the image both Portainer stacks run: an upstream umputun/tg-spam release
+# with deploy/wb-compat/patches applied (deploy/wb-compat/build-image.sh). This repository
+# carries no upstream code; the release is fetched from upstream at build time.
 #
-# Only linux/amd64 is built: the deployment host is a single x86_64 EC2 instance, and
-# it is too slow to build this tree itself within the Portainer proxy timeout.
+# Tags in ghcr.io/wirenboard/tg-spam:
+#   :v1.29.1          the latest build of that upstream release
+#   :v1.29.1-<sha7>   one build, never moves (<sha7> is this repository's commit)
+#   :master, :latest  the newest upstream release
+# A stack pulls :master unless its IMAGE variable pins a release, so a bot is updated by
+# "Pull and redeploy" in Portainer and by nothing else: no run here touches the stacks.
+#
+# When upstream publishes a release, the daily run builds it and moves :master to it. A push to
+# master rebuilds the newest release with what was pushed; a push to any other branch, a pull
+# request's included, only checks and builds.
+#
+# Only linux/amd64 is built: the deployment host is a single x86_64 EC2 instance, and it is too
+# slow to build the image itself within the Portainer proxy timeout.
 
 on:
   push:
-    branches: [master]
+    branches: ["**"]
+  schedule:
+    - cron: "17 4 * * *" # 07:17 Moscow, every day
   workflow_dispatch:
+    inputs:
+      release:
+        description: upstream release to build, e.g. v1.29.1; the newest when empty
+        required: false
 
 # :master is a moving tag, so two overlapping runs can publish out of order and leave it
 # pointing at the older build. Keep one run per ref and drop the superseded one.
@@ -19,76 +36,144 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    # :master and the deploy webhooks are master-only, so a manual run from another branch
-    # would publish that branch as :master and push it into the two production chats
-    if: github.ref == 'refs/heads/master'
+  plan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      actions: write # keep the schedule alive, see below
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      newest: ${{ steps.plan.outputs.newest }}
+      build: ${{ steps.plan.outputs.build }}
     steps:
       - name: checkout
         uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      # Gate the deploy on the rendered production config, not just on the code: a broken
-      # compose file would otherwise reach the stacks through the webhook below.
+      - name: pick the upstream release
+        id: plan
+        env:
+          WANTED: ${{ inputs.release }}
+          EVENT: ${{ github.event_name }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
+        run: |
+          set -eu
+          newest=$(sh deploy/wb-compat/upstream-release.sh)
+          release=${WANTED:-$newest}
+          if ! printf '%s' "$release" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::not an upstream release tag: $release"
+            exit 1
+          fi
+          build=true
+          # the daily run only builds a release ghcr does not have yet
+          if [ "$EVENT" = schedule ] && docker manifest inspect "$IMAGE:$release" > /dev/null 2>&1; then
+            echo "$IMAGE:$release is published already"
+            build=false
+          fi
+          echo "upstream $release (newest $newest), build: $build"
+          {
+            echo "release=$release"
+            echo "newest=$newest"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+      # GitHub turns a schedule off after 60 days without a commit, and this repository rarely
+      # gets one. Enabling the workflow through the API resets that count.
+      - name: keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/wb-image.yml/enable"
+
+  # Gate the image on the rendered production config: a broken compose file would otherwise
+  # reach a stack on its next redeploy.
+  check-config:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - name: check rendered stack config
         run: sh deploy/wb-compat/check-stack-config.sh
+
+  # The tests of the packages our patches touch, on the patched upstream release. A patch that
+  # no longer applies to that release fails here.
+  test:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          # git apply --3way needs the blobs each patch was made against
+          fetch-depth: 0
+
+      - name: test patched packages
+        env:
+          UPSTREAM: ${{ needs.plan.outputs.release }}
+        run: sh deploy/wb-compat/test-image-tree.sh
+
+  build:
+    needs: [plan, check-config, test]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # owner-derived, so a fork of this repository publishes under its own account
+      IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
+      UPSTREAM: ${{ needs.plan.outputs.release }}
+      NEWEST: ${{ needs.plan.outputs.newest }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # for git apply --3way, see the test job
 
       # Plain docker instead of the docker/* actions: those are fetched from
       # codeload.github.com on every run, and a 429/503 there fails the job before it
       # starts (hit twice on 2026-08-17). The runner already ships docker with buildkit,
       # so the build needs nothing downloaded.
-      - name: build and push to ghcr.io
+      - name: build
+        run: |
+          set -eu
+          IMAGE="$IMAGE:$UPSTREAM" sh deploy/wb-compat/build-image.sh \
+            --build-arg CI=github \
+            --build-arg GITHUB_SHA="${{ github.sha }}" \
+            --build-arg GIT_BRANCH="$UPSTREAM"
+
+      # Every variable the two compose files hand the bot must still be an option of this
+      # build. A release that renames or drops one would otherwise be ignored silently by
+      # go-flags, and the bot would run without that setting.
+      - name: check the options the stacks set
+        run: sh deploy/wb-compat/check-image-options.sh "$IMAGE:$UPSTREAM"
+
+      # Publishing is master-only: a pull request or a manual run from another branch only
+      # proves the image builds.
+      - name: push to ghcr.io
+        if: github.ref == 'refs/heads/master'
         env:
-          # owner-derived: after the repo moves to the wirenboard org this publishes
-          # ghcr.io/wirenboard/tg-spam with no change to this file
-          IMAGE: ghcr.io/${{ github.repository_owner }}/tg-spam
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker build \
-            --build-arg CI=github \
-            --build-arg GITHUB_SHA="${{ github.sha }}" \
-            --build-arg GIT_BRANCH="${{ github.ref_name }}" \
-            -t "$IMAGE:master" -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
-          docker push "$IMAGE:master"
-          docker push "$IMAGE:${{ github.sha }}"
-          # latest mirrors master so a bare "docker pull" never serves a stale
-          # manually-pushed image; deploys still pin :master / :<sha>
-          docker push "$IMAGE:latest"
-          docker logout ghcr.io
-
-      # Deploy runs only after the image is published, so a red build never reaches the
-      # bots and the stack can never pull a tag that does not exist yet. The webhook is a
-      # Portainer "GitOps updates" URL: it makes the stack re-pull this repo and recreate
-      # the container. Without the secret the step is skipped, so the build stays usable
-      # for anyone without deploy access.
-      - name: trigger portainer redeploy
-        env:
-          WEBHOOK_CHAT: ${{ secrets.PORTAINER_WEBHOOK_WIRENBOARD_CHAT }}
-          WEBHOOK_UPDATE_CH: ${{ secrets.PORTAINER_WEBHOOK_UPDATE_CH }}
-        run: |
-          set -eu
-          triggered=0
-          failed=0
-          for name in WEBHOOK_CHAT WEBHOOK_UPDATE_CH; do
-            url="${!name-}"   # indirect expansion, never eval a secret value
-            if [ -z "$url" ]; then
-              echo "$name is not set, skipping that stack"
-              continue
-            fi
-            if curl -fsS --retry 3 --retry-delay 5 -X POST "$url"; then
-              echo "$name redeploy triggered"
-              triggered=$((triggered + 1))
-            else
-              echo "$name webhook call failed"          # keep going: the other stack must still deploy
-              failed=$((failed + 1))
-            fi
+          tags="$UPSTREAM $UPSTREAM-$(printf '%s' "${{ github.sha }}" | cut -c1-7)"
+          # only the newest release moves the tags the stacks pull by default
+          if [ "$UPSTREAM" = "$NEWEST" ]; then
+            tags="$tags master latest"
+          fi
+          for t in $tags; do
+            [ "$t" = "$UPSTREAM" ] || docker tag "$IMAGE:$UPSTREAM" "$IMAGE:$t"
+            docker push -q "$IMAGE:$t"
+            echo "pushed $IMAGE:$t"
           done
-          echo "stacks triggered: $triggered, failed: $failed"
-          [ "$failed" -eq 0 ]
+          docker logout ghcr.io

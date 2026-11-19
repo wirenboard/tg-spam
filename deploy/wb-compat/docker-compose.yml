@@ -1,9 +1,9 @@
 services:
   tg-spam:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    # built by deploy.sh through build-image.sh: a plain build of the repository root would
+    # be upstream without our patches
     image: tg-spam-wb-compat:local
+    pull_policy: never
     container_name: tg-spam
     restart: unless-stopped
     env_file:

@@ -1,0 +1,346 @@
+From d3bd3d63c270670da7ffbcff4afa1b814d31f7b2 Mon Sep 17 00:00:00 2001
+From: "Aleksandr.Khlebnikov" <aleksandr.khlebnikov@wirenboard.com>
+Date: Tue, 17 Nov 2026 09:37:17 +0300
+Subject: [PATCH] Repost the original message after an admin unbans its author
+
+--message.restore / MESSAGE_RESTORE: when an admin presses unban on a ban report,
+the bot posts the text of the deleted message back to the primary chat, addressed
+to its author with a text_mention and prefixed with this message. Empty disables
+it. Training and dry modes never delete the message, so nothing is reposted there.
+
+Without it a wrongly banned author is unrestricted, but the question is gone and
+nothing tells them to ask again: with NO_SPAM_REPLY the chat never saw a word
+about the ban.
+
+The logic lives in its own file and sends with an entity rather than a parse
+mode, so the rest of the change is a few one-line hooks.
+---
+ README.md                        |   1 +
+ app/config/settings.go           |   1 +
+ app/events/admin.go              |   3 +-
+ app/events/admin_restore.go      |  53 +++++++++++
+ app/events/admin_restore_test.go | 152 +++++++++++++++++++++++++++++++
+ app/events/listener.go           |   2 +
+ app/main.go                      |   2 +
+ app/settings.go                  |   1 +
+ 8 files changed, 214 insertions(+), 1 deletion(-)
+ create mode 100644 app/events/admin_restore.go
+ create mode 100644 app/events/admin_restore_test.go
+
+diff --git a/README.md b/README.md
+index 6569e47aa9ade7b110da018e1411b592b6875624..35cc97253ff86f98dee0ec5c640e443a4bde403b 100644
+--- a/README.md
++++ b/README.md
+@@ -820,6 +820,7 @@ message:
+       --message.spam=                   spam message (default: this is spam) [$MESSAGE_SPAM]
+       --message.dry=                    spam dry message (default: this is spam (dry mode)) [$MESSAGE_DRY]
+       --message.warn=                   warning message (default: You've violated our rules and this is your first and last warning. Further violations will lead to permanent access denial. Stay compliant or face the consequences!) [$MESSAGE_WARN]
++      --message.restore=                message to repost the original text with after an admin unbans its author, disabled if empty [$MESSAGE_RESTORE]
+ 
+ server:
+       --server.enabled                  enable web server [$SERVER_ENABLED]
+diff --git a/app/config/settings.go b/app/config/settings.go
+index 3eee032ba2d0169bab7d6c40262227586453f092..74c3ab5300c095f199fcdd368b0090640fb587a4 100644
+--- a/app/config/settings.go
++++ b/app/config/settings.go
+@@ -249,6 +249,7 @@ type MessageSettings struct {
+ 	Spam    string `json:"spam" yaml:"spam" db:"message_spam"`
+ 	Dry     string `json:"dry" yaml:"dry" db:"message_dry"`
+ 	Warn    string `json:"warn" yaml:"warn" db:"message_warn"`
++	Restore string `json:"restore" yaml:"restore" db:"message_restore"`
+ }
+ 
+ // ServerSettings contains web server settings
+diff --git a/app/events/admin.go b/app/events/admin.go
+index 52c565d5be3a5e1be493347663d2431b32b2fb52..6d0b4b3d2a793c6a7b7f5a4a6b0af0792c4ebb4c 100644
+--- a/app/events/admin.go
++++ b/app/events/admin.go
+@@ -38,6 +38,7 @@ type admin struct {
+ 	softBan                bool // if true, the user not banned automatically, but only restricted
+ 	dry                    bool
+ 	warnMsg                string
++	restoreMsg             string // reposts the original text after an unban, see admin_restore.go
+ 	aggressiveCleanup      bool
+ 	aggressiveCleanupLimit int
+ 	warnings               Warnings      // storage for /warn records, used by DirectWarnReport auto-ban path
+@@ -996,7 +997,7 @@ func (a *admin) callbackUnbanConfirmed(query *tbapi.CallbackQuery) error {
+ 	if err := send(editMsg, a.tbAPI); err != nil {
+ 		return fmt.Errorf("failed to edit message, chatID:%d, msgID:%d, %w", chatID, query.Message.MessageID, err)
+ 	}
+-	return nil
++	return a.restoreMessage(userID, query.Message.Text)
+ }
+ 
+ func (a *admin) unban(userID int64) error {
+diff --git a/app/events/admin_restore.go b/app/events/admin_restore.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..920f83f9a5aae6a474e9e9cbb4aecb6a6c4062cc
+--- /dev/null
++++ b/app/events/admin_restore.go
+@@ -0,0 +1,53 @@
++package events
++
++import (
++	"fmt"
++	"log"
++	"strconv"
++	"unicode/utf16"
++
++	tbapi "github.com/OvyFlash/telegram-bot-api"
++)
++
++// restoreMessage reposts the text of a wrongly banned message to the primary chat once an admin
++// unbans its author: the ban deleted the message, and without the repost the author has to notice
++// that and write it again. report is the admin chat ban report the unban button belongs to, as
++// telegram returns it on the callback. disabled when restoreMsg is empty; training and dry modes
++// never delete the message, so there is nothing to restore there.
++//
++// the text is sent with an entity instead of a parse mode, so neither the author's name nor the
++// message needs escaping
++func (a *admin) restoreMessage(userID int64, report string) error {
++	if a.restoreMsg == "" || a.trainingMode || a.dry {
++		return nil
++	}
++	text, err := a.getCleanMessage(report)
++	if err != nil || text == "" {
++		return nil // a ban without a message, e.g. a reaction spammer, has nothing to restore
++	}
++	name, err := a.extractUsername(report)
++	if err != nil || name == "" {
++		name = strconv.FormatInt(userID, 10)
++	}
++
++	msg := tbapi.NewMessage(a.primChatID, name+", "+a.restoreMsg+"\n\n"+text)
++	msg.LinkPreviewOptions = tbapi.LinkPreviewOptions{IsDisabled: true}
++	if userID > 0 { // a channel has no user to mention
++		msg.Entities = []tbapi.MessageEntity{{Type: "text_mention", Offset: 0,
++			Length: len(utf16.Encode([]rune(name))), User: &tbapi.User{ID: userID}}}
++	}
++	if _, err = a.tbAPI.Send(msg); err == nil {
++		return nil
++	}
++	if len(msg.Entities) == 0 {
++		return fmt.Errorf("failed to repost the message of unbanned user %d: %w", userID, err)
++	}
++
++	// telegram refuses a mention of a user it does not let the bot see; the text matters more
++	log.Printf("[WARN] failed to repost the message of unbanned user %d with a mention, retrying without: %v", userID, err)
++	msg.Entities = nil
++	if _, err = a.tbAPI.Send(msg); err != nil {
++		return fmt.Errorf("failed to repost the message of unbanned user %d: %w", userID, err)
++	}
++	return nil
++}
+diff --git a/app/events/admin_restore_test.go b/app/events/admin_restore_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..08ceafebbd8fa2821a9fc5e744e217ce321bf499
+--- /dev/null
++++ b/app/events/admin_restore_test.go
+@@ -0,0 +1,152 @@
++package events
++
++import (
++	"context"
++	"testing"
++
++	tbapi "github.com/OvyFlash/telegram-bot-api"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/umputun/tg-spam/app/events/mocks"
++	"github.com/umputun/tg-spam/app/storage"
++)
++
++const testRestoreMsg = "прошу прощения, принял вас за спамера. Вот ваше сообщение"
++
++// newRestoreAdmin returns an admin in soft-ban mode wired to mocks, with the primary chat 123 and
++// the admin chat 456; sendErr decides the outcome of every send to the primary chat
++func newRestoreAdmin(restoreMsg string, sendErr func(tbapi.MessageConfig) error) (*admin, *mocks.TbAPIMock) {
++	mockAPI := &mocks.TbAPIMock{
++		SendFunc: func(c tbapi.Chattable) (tbapi.Message, error) {
++			if mc, ok := c.(tbapi.MessageConfig); ok && mc.ChatID == 123 && sendErr != nil {
++				return tbapi.Message{}, sendErr(mc)
++			}
++			return tbapi.Message{}, nil
++		},
++		RequestFunc: func(c tbapi.Chattable) (*tbapi.APIResponse, error) { return &tbapi.APIResponse{Ok: true}, nil },
++	}
++	adm := &admin{
++		tbAPI: mockAPI,
++		bot: &mocks.BotMock{
++			UpdateHamFunc:       func(msg string) error { return nil },
++			AddApprovedUserFunc: func(id int64, name string) error { return nil },
++		},
++		locator: &mocks.LocatorMock{
++			SpamFunc: func(ctx context.Context, userID int64) (storage.SpamData, bool) { return storage.SpamData{}, false },
++		},
++		primChatID: 123, adminChatID: 456, softBan: true, restoreMsg: restoreMsg,
++	}
++	return adm, mockAPI
++}
++
++func unbanQuery(data, report string) *tbapi.CallbackQuery {
++	return &tbapi.CallbackQuery{
++		ID:      "test-callback-id",
++		Data:    data,
++		Message: &tbapi.Message{MessageID: 789, Chat: tbapi.Chat{ID: 456}, Text: report},
++		From:    &tbapi.User{UserName: "admin", ID: 111},
++	}
++}
++
++// reposts returns the messages sent to the primary chat
++func reposts(mockAPI *mocks.TbAPIMock) (res []tbapi.MessageConfig) {
++	for _, call := range mockAPI.SendCalls() {
++		if mc, ok := call.C.(tbapi.MessageConfig); ok && mc.ChatID == 123 {
++			res = append(res, mc)
++		}
++	}
++	return res
++}
++
++func TestAdmin_callbackUnbanConfirmedRestore(t *testing.T) {
++	t.Run("reposts the original text addressed to its author", func(t *testing.T) {
++		adm, mockAPI := newRestoreAdmin(testRestoreMsg, nil)
++		query := unbanQuery("777:999", "restricted Иван_Петров (777)\n\nwhere do I buy a relay_module *now*?")
++		require.NoError(t, adm.callbackUnbanConfirmed(query))
++
++		sent := reposts(mockAPI)
++		require.Len(t, sent, 1)
++		assert.Equal(t, "Иван_Петров, "+testRestoreMsg+"\n\nwhere do I buy a relay_module *now*?", sent[0].Text,
++			"the text goes out as is, nothing escaped")
++		assert.Empty(t, sent[0].ParseMode)
++		require.Len(t, sent[0].Entities, 1)
++		ent := sent[0].Entities[0]
++		assert.Equal(t, "text_mention", ent.Type)
++		assert.Equal(t, 0, ent.Offset)
++		assert.Equal(t, 11, ent.Length, "length in utf-16 units of the name")
++		require.NotNil(t, ent.User)
++		assert.Equal(t, int64(777), ent.User.ID)
++	})
++
++	t.Run("names a channel without a mention", func(t *testing.T) {
++		adm, mockAPI := newRestoreAdmin(testRestoreMsg, nil)
++		require.NoError(t, adm.callbackUnbanConfirmed(unbanQuery("-100123:999", "restricted Spam Channel (-100123)\n\nchannel post")))
++
++		sent := reposts(mockAPI)
++		require.Len(t, sent, 1)
++		assert.Equal(t, "Spam Channel, "+testRestoreMsg+"\n\nchannel post", sent[0].Text)
++		assert.Empty(t, sent[0].Entities)
++	})
++
++	t.Run("falls back to the user id when the report has no name", func(t *testing.T) {
++		adm, mockAPI := newRestoreAdmin(testRestoreMsg, nil)
++		require.NoError(t, adm.callbackUnbanConfirmed(unbanQuery("777:999", "some report line\n\nhello there")))
++
++		sent := reposts(mockAPI)
++		require.Len(t, sent, 1)
++		assert.Equal(t, "777, "+testRestoreMsg+"\n\nhello there", sent[0].Text)
++	})
++
++	t.Run("retries without the mention when telegram refuses it", func(t *testing.T) {
++		adm, mockAPI := newRestoreAdmin(testRestoreMsg, func(mc tbapi.MessageConfig) error {
++			if len(mc.Entities) > 0 {
++				return assert.AnError
++			}
++			return nil
++		})
++		require.NoError(t, adm.callbackUnbanConfirmed(unbanQuery("777:999", "restricted Ivan (777)\n\nhello")))
++
++		sent := reposts(mockAPI)
++		require.Len(t, sent, 2)
++		assert.NotEmpty(t, sent[0].Entities)
++		assert.Empty(t, sent[1].Entities)
++		assert.Equal(t, sent[0].Text, sent[1].Text)
++	})
++
++	t.Run("reports a repost that fails after the unban", func(t *testing.T) {
++		adm, mockAPI := newRestoreAdmin(testRestoreMsg, func(tbapi.MessageConfig) error { return assert.AnError })
++		err := adm.callbackUnbanConfirmed(unbanQuery("777:999", "restricted Ivan (777)\n\nhello"))
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "unbanned user 777")
++
++		unbanned := false
++		for _, call := range mockAPI.RequestCalls() {
++			if _, ok := call.C.(tbapi.RestrictChatMemberConfig); ok {
++				unbanned = true
++			}
++		}
++		assert.True(t, unbanned, "the unban itself happens before the repost")
++	})
++
++	for _, tt := range []struct {
++		name               string
++		restoreMsg, report string
++		training, dry      bool
++	}{
++		{name: "disabled without a restore message", report: "restricted Ivan (777)\n\nhello"},
++		{name: "training mode never deleted the message", restoreMsg: testRestoreMsg, training: true,
++			report: "restricted Ivan (777)\n\nhello"},
++		{name: "dry mode never deleted the message", restoreMsg: testRestoreMsg, dry: true,
++			report: "restricted Ivan (777)\n\nhello"},
++		{name: "a ban without a message has nothing to restore", restoreMsg: testRestoreMsg,
++			report: "restricted Ivan (777) reaction spammer"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			adm, mockAPI := newRestoreAdmin(tt.restoreMsg, nil)
++			adm.trainingMode, adm.dry = tt.training, tt.dry
++			require.NoError(t, adm.callbackUnbanConfirmed(unbanQuery("777:999", tt.report)))
++			assert.Empty(t, reposts(mockAPI), "nothing may be posted to the primary chat")
++		})
++	}
++}
+diff --git a/app/events/listener.go b/app/events/listener.go
+index dd08b9fd42ea5e59eccc03f2ee47f497758af685..90ae07432f41d29ba0114fdfb73af1bf8fc15ee5 100644
+--- a/app/events/listener.go
++++ b/app/events/listener.go
+@@ -53,6 +53,7 @@ type TelegramListener struct {
+ 	TestingIDs              []int64       // list of chat IDs to test the bot
+ 	StartupMsg              string        // message to send on startup to the primary chat
+ 	WarnMsg                 string        // message to send on warning
++	RestoreMsg              string        // message to repost the original text with after an unban, disabled if empty
+ 	NoSpamReply             bool          // do not reply on spam messages in the primary chat
+ 	SuppressJoinMessage     bool          // delete join message when kick out user
+ 	DeleteJoinMessages      bool          // delete join messages immediately
+@@ -152,6 +153,7 @@ func (l *TelegramListener) Do(ctx context.Context) error {
+ 		tbAPI: l.TbAPI, bot: l.Bot, locator: l.Locator, superUsers: l.SuperUsers,
+ 		primChatID: l.chatID, linkedChannelID: l.linkedChannelID, adminChatID: l.adminChatID,
+ 		trainingMode: l.TrainingMode, softBan: l.SoftBanMode, dry: l.Dry, warnMsg: l.WarnMsg,
++		restoreMsg:        l.RestoreMsg,
+ 		aggressiveCleanup: l.AggressiveCleanup, aggressiveCleanupLimit: l.AggressiveCleanupLimit,
+ 		warnings: l.Warnings, warnThreshold: l.WarnThreshold, warnWindow: l.WarnWindow,
+ 	}
+diff --git a/app/main.go b/app/main.go
+index da42ba678bdb9065dae00d9bc6bd0e436930f737..64218acdf06e0ec3462cb4f0e5711c1dcb98d019 100644
+--- a/app/main.go
++++ b/app/main.go
+@@ -217,6 +217,7 @@ type options struct {
+ 		Spam    string `long:"spam" env:"SPAM" default:"this is spam" description:"spam message"`
+ 		Dry     string `long:"dry" env:"DRY" default:"this is spam (dry mode)" description:"spam dry message"`
+ 		Warn    string `long:"warn" env:"WARN" default:"You've violated our rules and this is your first and last warning. Further violations will lead to permanent access denial. Stay compliant or face the consequences!" description:"warning message"`
++		Restore string `long:"restore" env:"RESTORE" default:"" description:"message to repost the original text with after an admin unbans its author, disabled if empty"`
+ 	} `group:"message" namespace:"message" env-namespace:"MESSAGE"`
+ 
+ 	Server struct {
+@@ -518,6 +519,7 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
+ 		Bot:                 spamBot,
+ 		StartupMsg:          settings.Message.Startup,
+ 		WarnMsg:             settings.Message.Warn,
++		RestoreMsg:          settings.Message.Restore,
+ 		NoSpamReply:         settings.NoSpamReply,
+ 		SuppressJoinMessage: settings.SuppressJoinMessage,
+ 		DeleteJoinMessages:  settings.Delete.JoinMessages,
+diff --git a/app/settings.go b/app/settings.go
+index a96efc5162e7891f61928e0e78ef5756d2d58c31..f1612f256f57ff520b2ae50d2ee52a1d80bb0b58 100644
+--- a/app/settings.go
++++ b/app/settings.go
+@@ -170,6 +170,7 @@ func optToSettings(opts options) *config.Settings {
+ 			Spam:    opts.Message.Spam,
+ 			Dry:     opts.Message.Dry,
+ 			Warn:    opts.Message.Warn,
++			Restore: opts.Message.Restore,
+ 		},
+ 
+ 		Server: config.ServerSettings{
+-- 
+2.55.0.windows.3
+

@@ -10,7 +10,7 @@ if [ ! -f .env ]; then
 fi
 
 echo "[1/4] Building image"
-docker compose build --pull
+IMAGE=tg-spam-wb-compat:local sh ./build-image.sh --pull
 
 echo "[2/4] Starting service"
 docker compose up -d --remove-orphans

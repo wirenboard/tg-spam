@@ -36,6 +36,10 @@ if printf '%s\n' "$OUT" | grep -Eq -- '--super'; then
   fail=1
 fi
 
+# the Combot key must reach the container: without it CAS is skipped, and nothing breaks
+# loudly enough to notice
+need 'CAS_TOKEN: dummy-cas-token'
+
 # values the stack env pins
 need 'OPENAI_MODEL: gpt-5.6-sol'
 need 'MIN_PROBABILITY: "?35"?'
@@ -59,6 +63,19 @@ if renders_without_env docker-compose.portainer.yml; then
   fail=1
 fi
 
+# The file defaults on their own must reproduce the support chat profile: a new chat is
+# deployed with credentials and volume names and nothing else, so a default that drifts
+# away from the live bot hands that chat different thresholds without anyone noticing.
+OUT=$(DATA_VOLUME_NAME=defaults-probe LOG_VOLUME_NAME=defaults-probe-log \
+  docker compose -f docker-compose.portainer.yml config 2>/dev/null)
+need 'SOFT_BAN: "?true"?'
+need 'OPENAI_VETO: "?false"?'
+need 'AGGRESSIVE_CLEANUP: "?false"?'
+need 'MAX_EMOJI: "?2"?'
+need 'MIN_PROBABILITY: "?35"?'
+need 'META_LINKS_LIMIT: "?1"?'
+need 'META_MENTIONS_LIMIT: "?1"?'
+
 ### update channel (deploy/wb-compat/docker-compose.update-channel.yml)
 
 UC=deploy/wb-compat/docker-compose.update-channel.yml
@@ -66,6 +83,7 @@ OUT=$(docker compose --env-file deploy/wb-compat/update-channel-test.env -f "$UC
 
 need 'image: ghcr.io/wirenboard/tg-spam:'
 need 'pull_policy: always'
+need 'CAS_TOKEN: dummy-cas-token'
 # this bot keeps its dynamic data at the volume root, mounted at /srv/var - the mount
 # point and FILES_DYNAMIC must agree or it starts on an empty database
 need 'FILES_DYNAMIC: /srv/var'
@@ -76,6 +94,8 @@ need 'SOFT_BAN: "?true"?'
 need 'DISABLE_ADMIN_SPAM_FORWARD: "?true"?'
 need 'MIN_MSG_LEN: "?20"?'
 need 'SIMILARITY_THRESHOLD: "?0.7"?'
+# the stack sets false; the file default must agree, or dropping the variable flips the mode
+need 'OPENAI_VETO: "?false"?'
 # the volumes belong to the stack this one replaced, so they must stay external:
 # adopting them by label would fail, and a non-external declaration could delete them
 need 'external: true'
