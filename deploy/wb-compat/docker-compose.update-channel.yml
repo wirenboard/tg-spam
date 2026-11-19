@@ -1,5 +1,6 @@
 # The update-channel bot, managed exactly like the support-chat one: git-deployed stack,
-# image published by .github/workflows/wb-image.yml, redeploy triggered by a webhook.
+# image published by .github/workflows/wb-image.yml, updated by "Pull and redeploy" (to
+# hold a release, set IMAGE in the stack, e.g. ghcr.io/wirenboard/tg-spam:v1.29.1).
 # It keeps its own file because the deployment shape differs - no web UI, no published
 # port, data mounted where this volume already holds it (/srv/var), and the detector
 # tuned for a channel comment section rather than the support chat.

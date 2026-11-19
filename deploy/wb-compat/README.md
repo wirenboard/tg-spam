@@ -16,9 +16,22 @@ Portainer, not in the code.
 | Web UI | `:8081` | none |
 | Ban mode | soft ban (restrict) | same |
 
-Both pull `ghcr.io/wirenboard/tg-spam:master` (published by `wb-image.yml`); the stack
-variable `IMAGE` overrides it. Every build also keeps a `:<sha>` tag, so setting `IMAGE`
-to it pins or rolls back one stack.
+## Updating a bot
+
+A bot is updated in Portainer and nowhere else: the stack → **Pull and redeploy**. Both
+stacks pull `ghcr.io/wirenboard/tg-spam:master`, which is always the newest upstream
+release built with our patch, so a redeploy brings the bot to it. Leave Portainer's
+"re-pull image" off - `pull_policy: always` in the compose already pulls.
+
+To hold a stack on a release, or to roll it back, set its `IMAGE` variable to that release
+and redeploy, e.g. `IMAGE=ghcr.io/wirenboard/tg-spam:v1.29.1`. Remove the variable to follow
+the newest again. Each version change makes the bot back its database up next to it as
+`tg-spam.db.<version>-<timestamp>` inside the data volume (`MAX_BACKUPS=10`).
+
+What changed in a release: [umputun/tg-spam releases](https://github.com/umputun/tg-spam/releases).
+Its image appears in ghcr within a day: `.github/workflows/wb-image.yml` looks for a new
+release every morning, builds it and moves `:master` to it. Nothing here ever touches the
+stacks.
 
 ## What the update channel overrides, and why
 
@@ -53,104 +66,66 @@ environment. Moving it onto `docker-compose.portainer.yml` would remove both dif
 but its data has to reach `/srv/data` first - either by moving the files inside the volume
 or by turning the mount point into a variable.
 
-## What is ours in this repository
+## How the image is built
 
-Everything outside these paths is upstream [umputun/tg-spam](https://github.com/umputun/tg-spam)
-byte for byte, at the release named in `deploy/wb-compat/UPSTREAM_VERSION`;
-`check-upstream-files.sh` asserts it on every push:
+This repository carries no tg-spam code, only what is ours:
 
+- `docker-compose.portainer.yml` - the support chat's compose file;
 - `deploy/wb-compat/` - this README, the update channel's compose file, the build and check
   scripts, our patches and our preset data;
-- `docker-compose.portainer.yml` - the support chat's compose file;
-- `.github/workflows/wb-*.yml` - our CI. Upstream's workflows are not kept: they build and
-  publish umputun/tg-spam.
+- `.github/workflows/wb-image.yml` - the build.
 
-What we change in the bot itself is applied at build time, never committed into upstream's
-files. `prepare-tree.sh` checks the committed tree out into a temporary directory, applies
-every patch in `patches/` with `git apply --3way` and appends `data/stop-words.txt` to the
-preset dictionary; upstream's own `Dockerfile` then builds that directory
-(`build-image.sh`). That is the whole trick: since no upstream file differs, a merge of a
-new upstream release cannot conflict. And since a patch goes in as a three-way merge,
-upstream edits next to our lines merge on their own; only a change to the very lines we
-touch, or to code our patch calls, needs a person.
+`build-image.sh` takes an upstream release as it is: `prepare-tree.sh` checks the release
+out into a temporary directory, applies every patch in `patches/` with `git apply --3way`
+and appends `data/stop-words.txt` to the preset dictionary, and upstream's own `Dockerfile`
+builds the result. A new upstream release therefore needs nothing done here. And since a
+patch goes in as a three-way merge, upstream edits next to our lines merge on their own;
+only a change to the very lines we touch, or to code our patch calls, needs a person.
 
 | Patch | What it does | Why it is not upstream |
 |---|---|---|
 | `0001-restore-message-after-unban.patch` | `MESSAGE_RESTORE`: when an admin presses unban on a ban report, the bot posts the deleted text back to the chat, addressed to its author and prefixed with that message. Empty disables it; dry and training modes skip it, they never delete | Not proposed upstream yet |
 
 Before adding anything here, check that upstream has no option for it, and prefer sending
-the change upstream: every patch is code this fork has to carry through each release.
+the change upstream: every patch is code we have to carry through each release.
 
-## Updating from upstream
+Every build is checked before it is published: the rendered stack config, the tests of the
+packages our patches touch, and that every variable the two compose files set is still an
+option of the new binary. Tags in `ghcr.io/wirenboard/tg-spam`:
 
-Updates are taken by hand, when someone decides to. Upstream's releases and their notes are
-at [umputun/tg-spam releases](https://github.com/umputun/tg-spam/releases);
-`UPSTREAM_VERSION` says which one `master` is on.
+| Tag | What it is |
+|---|---|
+| `:v1.29.1` | the latest build of that upstream release |
+| `:v1.29.1-<sha7>` | one build, never moves; `<sha7>` is this repository's commit |
+| `:master`, `:latest` | the newest upstream release |
 
-```sh
-git fetch origin
-git switch -c upstream-v1.30.0 origin/master
-sh deploy/wb-compat/merge-upstream.sh v1.30.0   # without a tag: the newest release
-git push -u origin HEAD
-```
+A push to `master` rebuilds the newest release with what was pushed; a push to another
+branch, a pull request's included, only checks and builds. Actions → **wb-image** → **Run
+workflow** builds a given release. The workflow keeps its own schedule alive: GitHub turns
+a schedule off after 60 days without a commit.
 
-`merge-upstream.sh` merges the release, keeps this fork's `.github/workflows` (upstream's
-workflows are not kept here) and moves `UPSTREAM_VERSION` to the new tag. Then open a pull
-request into `master` of wirenboard/tg-spam - GitHub offers umputun/tg-spam as the base by
-default. `wb-image.yml` checks the branch the way it checks any branch: the rendered stack
-config, upstream's files untouched, the tests of the patched packages, the image build, and
-that every variable the two compose files set is still an option of the new binary. Merge
-when it is green: the push to `master` publishes the image and redeploys both stacks.
+## When a build fails
 
-Prefer **Create a merge commit**, which keeps upstream's history in `master`. A squash
-merge works too: `merge-upstream.sh` finds the release named in `UPSTREAM_VERSION` missing
-from the history and, once the files are checked to be exactly that release, records it as
-merged.
+Nothing is published then: `:master` stays on the last good build, and redeploys keep
+getting it. The usual cause is a patch that no longer applies because upstream changed the
+very lines around it:
 
-Red checks usually mean a patch that no longer applies because upstream changed the very
-lines around it:
-
-1. In a clone of this repository, check the release tag out into a scratch worktree
-   (`git worktree add ../scratch <tag>`) and apply the patch there with
+1. Clone umputun/tg-spam, check the new release out, and apply the patch there with
    `git apply --3way <path to deploy/wb-compat/patches/the patch>`.
-2. Resolve the conflicts, make the package's tests pass
-   (`go test -short ./app/...`), commit, and regenerate the file with
-   `git format-patch -1 --full-index --stdout`. `--full-index` matters: the full blob ids in
-   the patch are what lets the next release apply it three-way.
-3. Commit the refreshed patch to the update branch and push: the pull request picks it up
-   and `wb-image.yml` checks it again.
+2. Resolve the conflicts, make the package's tests pass (`go test -short ./app/...`),
+   commit, and regenerate the file with `git format-patch -1 --full-index --stdout`.
+   `--full-index` matters: the full blob ids in the patch are what lets the next release
+   apply it three-way.
+3. Replace the patch here through a pull request; merging it builds the release.
 
 When upstream gains the same feature, delete the patch and switch the compose files to
-upstream's option. With `patches/` empty, the image is plain upstream plus our preset
-stop phrases.
-
-## How an update reaches the bots
-
-Push to `master` (a merged pull request) →
-`.github/workflows/wb-image.yml` asserts the rendered production config, tests and builds
-the patched image, checks that it still has every option the stacks set, publishes it to
-ghcr, and only then calls the Portainer webhooks that redeploy the stacks. A failed check
-or build leaves `:master` on the previous image and never reaches a bot.
-
-The webhooks come from two repository secrets, `PORTAINER_WEBHOOK_WIRENBOARD_CHAT` and
-`PORTAINER_WEBHOOK_UPDATE_CH` (Portainer: the stack → **GitOps updates** → **Webhook** →
-**Copy link**). Without them a new image waits on ghcr until someone redeploys the stack.
-**Polling** does not fit here: it redeploys as soon as git changes, before CI has built the
-image.
+upstream's option. With `patches/` empty, the image is plain upstream plus our preset stop
+phrases.
 
 Nothing is built on the deployment host. It is a 2-CPU EC2 instance: the build takes
 minutes and dies on the reverse-proxy timeout, which is why builds through the Portainer
 UI fail. If CI cannot publish, `deploy/wb-compat/build-image.sh` builds on the host under
 the same image name and the stack is then deployed with `PULL_POLICY=never`.
-
-To redeploy by hand: Portainer → the stack → **Pull and redeploy**. Leave Portainer's
-"re-pull image" off - `pull_policy: always` in the compose already pulls.
-
-## Rollback
-
-Each version change makes the bot back its database up next to it as
-`tg-spam.db.<version>-<timestamp>` inside the data volume (`MAX_BACKUPS=10`). To go back
-to a known build, set the stack's image tag to that build's `:<sha>` and redeploy.
 
 ## Things that have already broken
 
@@ -181,12 +156,12 @@ Without `SERVER_AUTH_HASH` the bot generates a random password on every start an
 it to the log. To pin one, generate a bcrypt hash and put it in the stack environment:
 
 ```sh
-printf %s 'the password' | go run ./deploy/wb-compat/authhash
+docker run --rm -it httpd:2.4-alpine htpasswd -nBC 10 tg-spam
 ```
 
-The password is read from stdin, so it stays out of shell history and the process list.
-The root README suggests `htpasswd` or `mkpasswd`; this helper needs nothing but a
-checked-out repository.
+It asks for the password twice, showing nothing while you type, so the password stays out
+of shell history and the process list, and prints `tg-spam:<hash>`: the hash is everything
+after the colon.
 
 ## Secrets
 
